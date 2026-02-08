@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Emotion Recognition</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Audio-Visual Emotion Recognition</h1>
+        
+        <div class="main-panel">
+            <div class="left-panel">
+                <h2>Record Video</h2>
+                <video id="preview" autoplay muted></video>
+                <div class="controls">
+                    <button id="startBtn" class="btn btn-primary">Start Recording</button>
+                    <button id="stopBtn" class="btn btn-secondary" disabled>Stop Recording</button>
+                    <button id="uploadBtn" class="btn btn-success" disabled>Predict Emotion</button>
+                </div>
+                <p class="timer" id="timer"></p>
+                <p class="status" id="status">Ready</p>
+            </div>
+            
+            <div class="right-panel">
+                <h2>Results</h2>
+                <div id="results" class="results-container">
+                    <p class="placeholder">No results yet. Record and upload a video.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+version: "3.8"
+
+services:
+  # Backend API Server
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: emotion_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - USE_GPU=0
+      - EMO_MOCK=1
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./backend/app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Frontend Web Server
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: emotion_frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/usr/share/nginx/html
+
+  # vLLM OpenAI API Server (optional LLM service)
+  # NOTE: Disabled by default - vLLM requires GPU support
+  # To enable, uncomment below and configure Docker GPU access
+  # vllm:
+  #   image: vllm/vllm-openai:latest
+  #   container_name: emotion_vllm
+  #   ports:
+  #     - "8001:8000"
+  #   environment:
+  #     - CUDA_VISIBLE_DEVICES=0
+  #   volumes:
+  #     - huggingface_cache:/root/.cache/huggingface
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   command: --model meta-llama/Llama-2-7b-hf
+
+volumes:
+  huggingface_cache:

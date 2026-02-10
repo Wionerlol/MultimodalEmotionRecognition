@@ -160,12 +160,17 @@
 输入与时序处理：
 
 - 视频：`[B,T,3,H,W] -> backbone -> [B,T,512] -> Linear(512->d_model)`
-- 音频（Mel 路径）：`[B,1,n_mels,Ta] -> squeeze -> [B,n_mels,Ta] -> Conv1d(n_mels->d_model) -> [B,Ta,d_model] -> Linear(d_model->d_model)`
+- 音频主路径（warm-start 友好）：
+  - 若 `audio_model` 提供 `encode_sequence()`（WavLM/AudioNet 已提供），则走：
+  - `audio_model.encode_sequence(audio) -> [B,Ta,H] -> Linear(H->d_model)`
+- 音频回退路径（兼容旧 mel 编码器）：
+  - `[B,1,n_mels,Ta] -> squeeze -> [B,n_mels,Ta] -> Conv1d(n_mels->d_model) -> [B,Ta,d_model] -> Linear(d_model->d_model)`
 
 跨模态注意力：
 
-- `v2a_attn(query=v, key=a, value=a)` + 残差层归一化
-- `a2v_attn(query=a, key=v, value=v)` + 残差层归一化
+- `v2a_attn(query=v, key=a, value=a, dropout=xattn_attn_dropout)` + 残差层归一化
+- `a2v_attn(query=a, key=v, value=v, dropout=xattn_attn_dropout)` + 残差层归一化
+- 残差分支支持 `StochasticDepth(drop_prob=xattn_stochastic_depth)`
 
 池化与头部：
 
@@ -189,7 +194,7 @@
 ### 4.2 损失函数
 
 - `fusion == "late"`：`NLLLoss`（因为模型输出概率，训练前取 `log`）
-- 其他模式：`CrossEntropyLoss`
+- 其他模式：`CrossEntropyLoss(label_smoothing=label_smoothing)`
 
 ### 4.3 优化器与调度器
 
@@ -222,6 +227,9 @@
   - `--video_ckpt`
   - `--fusion_unfreeze_audio`
   - `--no_fusion_unfreeze_audio`
+  - `--xattn_attn_dropout`
+  - `--xattn_stochastic_depth`
+  - `--label_smoothing`
 - 行为：
   - 在构建融合模型后，将 checkpoint 分别加载到 `audio_model` / `video_model`
   - 支持 `{"model": state_dict}` 或原始 `state_dict` 两种格式
@@ -367,12 +375,47 @@ uv run python src/train.py \
 
 ---
 
+### 6.5 Warm-Start xAttn 融合（两阶段 + 正则化）
+
+```bash
+uv run python src/train.py \
+  --data_root data \
+  --num_classes 8 \
+  --fusion xattn \
+  --xattn_head gated \
+  --xattn_d_model 96 \
+  --xattn_heads 4 \
+  --xattn_attn_dropout 0.1 \
+  --xattn_stochastic_depth 0.1 \
+  --label_smoothing 0.05 \
+  --use_wavlm \
+  --audio_ckpt outputs/best_audio.pt \
+  --video_ckpt outputs/best_video.pt \
+  --two_stage_training \
+  --stage1_epochs 6 \
+  --lr 2e-4 \
+  --audio_backbone_lr 8e-6 \
+  --video_backbone_lr 8e-6 \
+  --fusion_unfreeze_wavlm_layers 2 \
+  --fusion_unfreeze_video_blocks 1 \
+  --split_mode stratified \
+  --train_ratio 0.75 \
+  --val_ratio 0.15 \
+  --epochs 35 \
+  --batch_size 8 \
+  --weight_decay 2e-4 \
+  --use_cosine_annealing \
+  --early_stopping_patience 10
+```
+
+---
+
 ## 7. 代码现状中的注意点（与训练架构强相关）
 
 以下是当前仍需注意的行为：
 
-1. `--train_ratio`、`--val_ratio` 已在 CLI 定义，但当前 `run()` 没有把它们传给 `build_dataloaders()`；`stratified` 实际仍使用默认 `0.7/0.15/0.15`。
-2. `--use_wavlm --fusion xattn` 与当前数据形态不匹配：`xattn` 分支期望 `[B,1,n_mels,T]` 风格输入做 `Conv1d`，而 WavLM 数据集输出原始波形 `[B,1,T]`，会触发通道维错误。
+1. `--train_ratio`、`--val_ratio` 已接入 `stratified` 主流程，`test_ratio` 由 `1-train_ratio-val_ratio` 自动计算；建议保持三者和为 1.0。
+2. `--use_wavlm --fusion xattn` 已支持序列特征路径（`encode_sequence()`）；若自定义音频编码器未实现该接口，会自动回退到 mel-conv 路径。
 
 ---
 
@@ -386,5 +429,5 @@ uv run python src/train.py \
 
 如果后续要继续扩展，优先建议围绕两点推进：
 
-1. 修正 `xattn + use_wavlm` 的输入形态兼容（raw wav 与 mel 序列对齐）。
-2. 将 `train_ratio/val_ratio` 接入主训练流程，避免与 CLI 语义不一致。
+1. 为 xAttn 增加 attention mask（对无效时间步/补零区域更稳）。
+2. 在多 seed + 多 split 上做系统超参搜索（`d_model/heads/dropout/drop_path/label_smoothing`）。

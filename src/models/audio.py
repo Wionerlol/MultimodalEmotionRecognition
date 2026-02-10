@@ -148,6 +148,7 @@ class AudioNet(nn.Module):
                  spec_augment: bool = True) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.sequence_dim = embedding_dim
         
         # Use ResNet18 or lightweight CNN as encoder
         if use_resnet:
@@ -170,3 +171,11 @@ class AudioNet(nn.Module):
         emb = self.encode(x)
         return self.classifier(emb)
 
+    def encode_sequence(self, x: torch.Tensor) -> torch.Tensor:
+        """Return a compact sequence view for fusion models.
+
+        AudioNet is clip-level by design, so we expose a single-step sequence
+        to let xAttn consume encoder-derived features and benefit from warm-start.
+        """
+        emb = self.encode(x)  # [B, D]
+        return emb.unsqueeze(1)  # [B, 1, D]

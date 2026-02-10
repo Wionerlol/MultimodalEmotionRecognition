@@ -31,6 +31,7 @@ class WavLMAudioEncoder(nn.Module):
         
         # Get actual hidden size from model config
         actual_hidden_size = self.wavlm.config.hidden_size
+        self.sequence_dim = actual_hidden_size
         
         # Classification head
         self.classifier = nn.Sequential(
@@ -134,19 +135,7 @@ class WavLMAudioEncoder(nn.Module):
         Returns:
             Embedding [B, embedding_dim]
         """
-        if x.dim() == 3:
-            x = x.squeeze(1)  # [B, T]
-
-        # Preserve efficiency when backbone is frozen, but allow gradients
-        # in fusion stage-2 when selected WavLM layers are unfrozen.
-        wavlm_trainable = any(param.requires_grad for param in self.wavlm.parameters())
-        if self.training and wavlm_trainable:
-            outputs = self.wavlm(x)
-        else:
-            with torch.no_grad():
-                outputs = self.wavlm(x)
-        
-        hidden = outputs.last_hidden_state  # [B, T, hidden_size]
+        hidden = self.encode_sequence(x)
         a_emb = hidden.mean(dim=1)  # [B, hidden_size]
         
         # Project to embedding_dim if needed
@@ -155,3 +144,23 @@ class WavLMAudioEncoder(nn.Module):
             a_emb = self.classifier[0](a_emb)
         
         return a_emb
+
+    def encode_sequence(self, x: torch.Tensor) -> torch.Tensor:
+        """Get per-timestep hidden states for sequence-level fusion.
+
+        Args:
+            x: Raw waveform [B, 1, T] or [B, T]
+
+        Returns:
+            Sequence hidden states [B, T, hidden_size]
+        """
+        if x.dim() == 3:
+            x = x.squeeze(1)  # [B, T]
+
+        wavlm_trainable = any(param.requires_grad for param in self.wavlm.parameters())
+        if self.training and wavlm_trainable:
+            outputs = self.wavlm(x)
+        else:
+            with torch.no_grad():
+                outputs = self.wavlm(x)
+        return outputs.last_hidden_state

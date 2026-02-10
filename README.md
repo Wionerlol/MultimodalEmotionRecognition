@@ -39,6 +39,69 @@ docker compose up --build
 - **Mock Mode**: Test without trained checkpoint (for development)
 - **Experiment Tracking**: Weights & Biases integration for training metrics
 
+## Showcase Placeholders
+
+Use this section to display processed data examples, W&B comparisons, and your custom architecture diagram.
+
+### 1) Processed Data Examples (Audio + Video)
+
+Video example :
+
+<video controls width="720" src="assets/examples/processed_video_example.mp4">
+  Your browser does not support the video tag.
+</video>
+
+Audio example :
+
+<audio controls src="assets/examples/processed_audio_example.wav">
+  Your browser does not support the audio element.
+</audio>
+
+Alternative links :
+- [Processed Video Example](assets/examples/processed_video_example.mp4)
+- [Processed Audio Example](assets/examples/processed_audio_example.wav)
+
+### 2) W&B Charts: 3-Run Comparison Dashboard
+
+This section is designed for your current chart format:
+- each figure contains curves from **3 runs**
+- each run includes **audio / video / multimodal** types in the same chart
+
+
+Train metrics (3 runs x 3 types in each figure):
+
+| Loss | Accuracy | Macro-F1 |
+|---|---|---|
+| ![Train Loss](assets/wandb_chart/train_loss.png) | ![Train Accuracy](assets/wandb_chart/train_acc.png) | ![Train F1](assets/wandb_chart/train_f1.png) |
+
+Validation metrics (3 runs x 3 types in each figure):
+
+| Loss | Accuracy | Macro-F1 |
+|---|---|---|
+| ![Val Loss](assets/wandb_chart/val_loss.png) | ![Val Accuracy](assets/wandb_chart/val_acc.png) | ![Val F1](assets/wandb_chart/val_f1.png) |
+
+Test metrics (3 runs x 3 types in each figure):
+
+| Loss | Accuracy | Macro-F1 |
+|---|---|---|
+| ![Test Loss](assets/wandb_chart/test_loss.png) | ![Test Accuracy](assets/wandb_chart/test_acc.png) | ![Test F1](assets/wandb_chart/test_f1.png) |
+
+Confusion matrices (best checkpoints or representative runs):
+
+| Audio | Video | Multimodal |
+|---|---|---|
+| ![Audio CM](assets/wandb_chart/audio_confusion_matrix.png) | ![Video CM](assets/wandb_chart/video_confusion_matrix.png) | ![Multimodal CM](assets/wandb_chart/multimodal_confusion_matrix.png) |
+
+### 3) Custom Model Architecture Diagram
+
+Recommended path:
+- `assets/diagrams/model_architecture_overview.png`
+
+![Model Architecture Diagram](assets/diagrams/model_architecture_overview.png)
+
+Optional caption template:
+> Figure: Your custom architecture diagram (replace with final version exported from your drawing tool).
+
 ## Project Structure
 
 ```
@@ -47,6 +110,10 @@ docker compose up --build
 ├── pyproject.toml             # Poetry configuration
 ├── README.md                  # This file
 ├── docker-compose.yml         # Docker Compose orchestration
+├── assets/
+│   ├── examples/              # README demo media (processed audio/video)
+│   ├── wandb/                 # README chart screenshots/exports
+│   └── diagrams/              # README architecture diagrams
 ├── src/
 │   ├── train.py               # Training loop with WavLM, face crop, augmentation
 │   ├── eval.py                # Evaluation script
@@ -254,32 +321,38 @@ python src/train.py \
 #### With Stratified Split (Multimodal Fusion)
 
 ```bash
-# Warm-start gated fusion from trained single-modality checkpoints
+# Warm-start xAttn fusion from trained single-modality checkpoints
 python src/train.py \
   --data_root data \
   --num_classes 8 \
-  --fusion gated \
+  --fusion xattn \
+  --xattn_head gated \
+  --xattn_d_model 96 \
+  --xattn_heads 4 \
+  --xattn_attn_dropout 0.1 \
+  --xattn_stochastic_depth 0.1 \
+  --label_smoothing 0.05 \
   --use_wavlm \
   --audio_ckpt outputs/best_audio.pt \
   --video_ckpt outputs/best_video.pt \
   --two_stage_training \
-  --stage1_epochs 5 \
+  --stage1_epochs 6 \
   --fusion_unfreeze_wavlm_layers 2 \
   --fusion_unfreeze_video_blocks 1 \
-  --lr 3e-4 \
-  --audio_backbone_lr 1e-5 \
-  --video_backbone_lr 1e-5 \
+  --lr 2e-4 \
+  --audio_backbone_lr 8e-6 \
+  --video_backbone_lr 8e-6 \
   --split_mode stratified \
-  --epochs 30 \
+  --train_ratio 0.75 \
+  --val_ratio 0.15 \
+  --epochs 35 \
   --batch_size 8 \
-  --weight_decay 1e-4 \
+  --weight_decay 2e-4 \
   --use_face_crop \
   --use_cosine_annealing \
-  --early_stopping_patience 8 \
+  --early_stopping_patience 10 \
   --wandb
 ```
-
-> Note: `--use_wavlm --fusion xattn` is currently not supported because xAttn expects mel-style audio tensor layout.
 
 #### Key Arguments
 
@@ -289,6 +362,12 @@ python src/train.py \
 | `--use_wavlm` | `False` | Use WavLM pretrained audio encoder (vs CNN) |
 | `--wavlm_stage` | `1` | WavLM training stage: 1 (freeze) or 2 (unfreeze) |
 | `--backbone_lr` | `3e-5` | Learning rate for WavLM backbone in stage 2 |
+| `--xattn_head` | `concat` | xAttn fusion head: `concat` or `gated` |
+| `--xattn_d_model` | `128` | xAttn hidden size |
+| `--xattn_heads` | `4` | Number of xAttn heads |
+| `--xattn_attn_dropout` | `0.1` | Attention dropout in xAttn MHA |
+| `--xattn_stochastic_depth` | `0.1` | Drop-path on xAttn residual branches |
+| `--label_smoothing` | `0.0` | Label smoothing for non-late CrossEntropy training |
 | `--audio_ckpt` | `""` | Warm-start fusion audio branch from standalone audio checkpoint |
 | `--video_ckpt` | `""` | Warm-start fusion video branch from standalone video checkpoint |
 | `--two_stage_training` | `False` | Enable two-stage fusion training |
@@ -301,6 +380,8 @@ python src/train.py \
 | `--no_fusion_unfreeze_audio` | - | Keep non-WavLM audio encoder frozen in Stage-2 |
 | `--use_face_crop` | `True` | Enable face detection & cropping (default enabled) |
 | `--split_mode` | `stratified` | `actor` (by actor) or `stratified` (by emotion) |
+| `--train_ratio` | `0.7` | Train ratio when `--split_mode stratified` |
+| `--val_ratio` | `0.15` | Validation ratio when `--split_mode stratified` |
 | `--weight_decay` | `1e-4` | L2 regularization |
 | `--early_stopping_patience` | `10` | Epochs without improvement before stopping |
 | `--use_cosine_annealing` | `False` | Use cosine annealing LR scheduler |
@@ -363,7 +444,8 @@ python src/train.py \
 4. **Cross-Attention (xAttn)**: Bidirectional multi-head attention between video and audio sequences
    - Video query attends to audio (v2a)
    - Audio query attends to video (a2v)
-   - Residual connections + LayerNorm
+   - Residual connections + LayerNorm + StochasticDepth
+   - Attention dropout in MHA + optional label smoothing in loss
    - Fusion head: concat or gated
 
 ## Advanced Features

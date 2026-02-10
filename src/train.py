@@ -4,6 +4,7 @@ import os
 import argparse
 import platform
 import sys
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -83,6 +84,8 @@ def build_dataloaders(
     device: torch.device,
     requested_num_workers: int = -1,
     stratified: bool = False,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
     use_wavlm: bool = False,
     train_augment: bool = True,
     use_face_crop: bool = True,
@@ -103,7 +106,14 @@ def build_dataloaders(
     # Use stratified split or actor-based split
     if stratified:
         print("Using stratified split (balanced emotion distribution)")
-        train_pairs, val_pairs, test_pairs = SPLIT_SERVICE.stratified(pairs, seed=42)
+        test_ratio = max(0.0, 1.0 - float(train_ratio) - float(val_ratio))
+        train_pairs, val_pairs, test_pairs = SPLIT_SERVICE.stratified(
+            pairs,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=42,
+        )
     else:
         print("Using actor-based split")
         train_pairs, val_pairs, test_pairs = SPLIT_SERVICE.by_actor(
@@ -295,6 +305,8 @@ def build_model(
     xattn_head: str = "concat",
     xattn_d_model: int = 128,
     xattn_heads: int = 4,
+    xattn_attn_dropout: float = 0.1,
+    xattn_stochastic_depth: float = 0.1,
     audio_n_mels: int = 64,
     use_resnet_audio: bool = True,
     use_wavlm: bool = False,
@@ -334,6 +346,8 @@ def build_model(
             d_model=xattn_d_model,
             num_heads=xattn_heads,
             audio_n_mels=audio_n_mels if not use_wavlm else 768,  # WavLM has 768 hidden dim
+            xattn_attn_dropout=xattn_attn_dropout,
+            xattn_stochastic_depth=xattn_stochastic_depth,
         )
     raise ValueError(f"Unknown fusion mode: {fusion}")
 
@@ -367,10 +381,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val_ratio", type=float, default=0.15, help="Validation set ratio (used only with --split_mode stratified)")
     parser.add_argument("--no_pretrained_video", action="store_true")
     parser.add_argument("--use_cosine_annealing", action="store_true", help="Use cosine annealing learning rate scheduler")
+    parser.add_argument(
+        "--cosine_stage2_only",
+        action="store_true",
+        help="For two-stage fusion training: keep stage-1 LR fixed, apply cosine scheduler only in stage-2.",
+    )
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--xattn_head", type=str, choices=["concat", "gated"], default="concat", help="xattn fusion head when --fusion xattn is used")
     parser.add_argument("--xattn_d_model", type=int, default=128, help="d_model for cross-attention (default 128)")
     parser.add_argument("--xattn_heads", type=int, default=4, help="number of attention heads for xattn (default 4)")
+    parser.add_argument(
+        "--xattn_attn_dropout",
+        type=float,
+        default=0.1,
+        help="Attention dropout probability for xattn MultiHeadAttention (default 0.1)",
+    )
+    parser.add_argument(
+        "--xattn_stochastic_depth",
+        type=float,
+        default=0.1,
+        help="Drop-path probability on xattn residual branches (default 0.1)",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing for CrossEntropyLoss in non-late modes (default 0.0)",
+    )
     parser.add_argument("--audio_n_mels", type=int, default=64, help="n_mels used in audio preprocessing (default 64)")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="L2 regularization weight decay (default: 1e-4)")
     parser.add_argument("--early_stopping_patience", type=int, default=10, help="Early stopping patience in epochs (set 0 to disable)")
@@ -483,11 +520,36 @@ class EmotionTrainer:
     def _build_scheduler(self, optimizer: torch.optim.Optimizer, epochs_in_stage: int):
         if not self.args.use_cosine_annealing:
             return None
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(1, epochs_in_stage),
-            eta_min=1e-5,
+
+        t_max = max(1, int(epochs_in_stage))
+        base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        # Group-wise eta_min to avoid raising low-LR backbone groups.
+        # Example: lr=8e-6 -> eta_min=8e-7 (instead of a global 1e-5 floor).
+        eta_mins = [max(1e-8, lr * 0.1) for lr in base_lrs]
+        print(
+            "[INFO] Cosine scheduler (group-wise): "
+            + ", ".join(
+                f"group{i}: base_lr={base_lrs[i]:.2e}, eta_min={eta_mins[i]:.2e}"
+                for i in range(len(base_lrs))
+            )
         )
+
+        lambdas = []
+        for base_lr, eta_min in zip(base_lrs, eta_mins):
+            if base_lr <= 0.0:
+                lambdas.append(lambda _epoch: 1.0)
+                continue
+
+            def lr_lambda(epoch: int, _base=base_lr, _min=eta_min, _tmax=t_max) -> float:
+                # Step scheduler at epoch end: use (epoch+1) so first .step() decays LR.
+                t = min(epoch + 1, _tmax)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * t / _tmax))
+                lr = _min + (_base - _min) * cosine
+                return lr / _base
+
+            lambdas.append(lr_lambda)
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
 
     @staticmethod
     def _optimizer_lr_text(optimizer: torch.optim.Optimizer) -> str:
@@ -697,6 +759,8 @@ class EmotionTrainer:
             device=device,
             requested_num_workers=args.num_workers,
             stratified=(args.split_mode == "stratified"),
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
             use_wavlm=args.use_wavlm,
             train_augment=True,
             use_face_crop=args.use_face_crop,
@@ -717,6 +781,8 @@ class EmotionTrainer:
             xattn_head=getattr(args, "xattn_head", "concat"),
             xattn_d_model=getattr(args, "xattn_d_model", 128),
             xattn_heads=getattr(args, "xattn_heads", 4),
+            xattn_attn_dropout=getattr(args, "xattn_attn_dropout", 0.1),
+            xattn_stochastic_depth=getattr(args, "xattn_stochastic_depth", 0.1),
             audio_n_mels=getattr(args, "audio_n_mels", 64),
             use_resnet_audio=getattr(args, "use_resnet_audio", True),
             use_wavlm=args.use_wavlm,
@@ -728,7 +794,10 @@ class EmotionTrainer:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model parameters: {total_params:,} (trainable: {trainable_params:,})\n")
 
-        loss_fn = nn.NLLLoss() if args.fusion == "late" else nn.CrossEntropyLoss()
+        if args.fusion == "late":
+            loss_fn = nn.NLLLoss()
+        else:
+            loss_fn = nn.CrossEntropyLoss(label_smoothing=max(0.0, float(args.label_smoothing)))
         two_stage_enabled = self._is_two_stage_fusion_enabled(model)
         current_stage = 0
         stage1_epochs = 0
@@ -742,7 +811,12 @@ class EmotionTrainer:
             current_stage = 1
             self._apply_two_stage_freeze_policy(model, stage=1)
             optimizer = self._build_optimizer(model, stage=1)
-            scheduler = self._build_scheduler(optimizer, epochs_in_stage=stage1_epochs)
+            if args.cosine_stage2_only:
+                scheduler = None
+                if args.use_cosine_annealing:
+                    print("[INFO] cosine_stage2_only enabled: stage-1 uses fixed LR.")
+            else:
+                scheduler = self._build_scheduler(optimizer, epochs_in_stage=stage1_epochs)
             print(
                 "[INFO] Two-stage fusion enabled: "
                 f"stage1_epochs={stage1_epochs}, stage2_epochs={stage2_epochs}, "

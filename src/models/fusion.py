@@ -4,6 +4,24 @@ import torch
 from torch import nn
 
 
+class StochasticDepth(nn.Module):
+    """Per-sample drop-path used on residual branches."""
+
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = float(max(0.0, min(1.0, drop_prob)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob <= 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        if keep_prob <= 0.0:
+            return torch.zeros_like(x)
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        return x * random_tensor / keep_prob
+
+
 class ModalityDropout(nn.Module):
     """Randomly drop audio or video modality during training."""
     def __init__(self, audio_dropout_p: float = 0.2, video_dropout_p: float = 0.2):
@@ -115,6 +133,8 @@ class FusionModel(nn.Module):
         d_model: int = 128,
         num_heads: int = 4,
         audio_n_mels: int = 64,
+        xattn_attn_dropout: float = 0.1,
+        xattn_stochastic_depth: float = 0.1,
     ) -> None:
         super().__init__()
         self.audio_model = audio_model
@@ -151,16 +171,24 @@ class FusionModel(nn.Module):
         if mode in {"xattn", "xattn_concat", "xattn_gated"}:
             # video per-frame dim (from video_model)
             self.v_dim = getattr(video_model, "embedding_dim", 512)
-            # audio per-time dim: use a small conv1d over mel-time
+            self.audio_sequence_dim = getattr(audio_model, "sequence_dim", d_model)
             self.a_dim = d_model
             # projectors
             self.v_in_proj = nn.Linear(self.v_dim, d_model)
             self.a_in_proj = nn.Linear(self.a_dim, d_model)
-            # audio time conv: convert mel spectrogram [B,1,n_mels,Ta] -> [B,Ta,a_dim]
+            # Audio conv fallback for mel-based encoders that do not provide sequence features.
+            # [B,1,n_mels,Ta] -> [B,Ta,a_dim]
             self.audio_time_conv = nn.Conv1d(in_channels=audio_n_mels, out_channels=self.a_dim, kernel_size=3, padding=1)
+            self.audio_seq_proj = nn.Linear(self.audio_sequence_dim, self.a_dim)
             # multihead attention
-            self.v2a_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
-            self.a2v_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
+            self.v2a_attn = nn.MultiheadAttention(
+                embed_dim=d_model, num_heads=num_heads, dropout=xattn_attn_dropout, batch_first=True
+            )
+            self.a2v_attn = nn.MultiheadAttention(
+                embed_dim=d_model, num_heads=num_heads, dropout=xattn_attn_dropout, batch_first=True
+            )
+            self.v_drop_path = StochasticDepth(drop_prob=xattn_stochastic_depth)
+            self.a_drop_path = StochasticDepth(drop_prob=xattn_stochastic_depth)
             self.v_norm = nn.LayerNorm(d_model)
             self.a_norm = nn.LayerNorm(d_model)
             # fusion head
@@ -169,6 +197,7 @@ class FusionModel(nn.Module):
                 self.xattn_mlp = nn.Sequential(
                     nn.Linear(d_model * 2, common_dim),
                     nn.ReLU(inplace=True),
+                    nn.Dropout(0.2),
                     nn.Linear(common_dim, num_classes),
                 )
             elif xattn_head == "gated":
@@ -216,21 +245,27 @@ class FusionModel(nn.Module):
             # project video
             v = self.v_in_proj(v_feat)  # [B, T, d_model]
 
-            # audio: [B, 1, n_mels, Ta] -> [B, n_mels, Ta]
-            a = audio.squeeze(1)
-            # apply conv1d over time: input [B, n_mels, Ta] -> [B, a_dim, Ta]
-            a_time = self.audio_time_conv(a)  # [B, a_dim, Ta]
-            a_seq = a_time.permute(0, 2, 1).contiguous()  # [B, Ta, a_dim]
+            if hasattr(self.audio_model, "encode_sequence"):
+                # Warm-start friendly path: use sequence states from audio encoder.
+                # WavLM returns [B, Ta, hidden], then project to attention dim.
+                a_seq = self.audio_model.encode_sequence(audio)
+                a_seq = self.audio_seq_proj(a_seq)
+            else:
+                # Mel fallback for encoders without sequence interface.
+                # audio: [B, 1, n_mels, Ta] -> [B, n_mels, Ta]
+                a_in = audio.squeeze(1)
+                a_time = self.audio_time_conv(a_in)  # [B, a_dim, Ta]
+                a_seq = a_time.permute(0, 2, 1).contiguous()  # [B, Ta, a_dim]
             # project audio (a_dim -> d_model)
             a = self.a_in_proj(a_seq)
 
             # cross-attention: v2 = MHA(query=v, key=a, value=a)
             v2, _ = self.v2a_attn(query=v, key=a, value=a)
-            v = self.v_norm(v + v2)
+            v = self.v_norm(v + self.v_drop_path(v2))
 
             # a2 = MHA(query=a, key=v, value=v)
             a2, _ = self.a2v_attn(query=a, key=v, value=v)
-            a = self.a_norm(a + a2)
+            a = self.a_norm(a + self.a_drop_path(a2))
 
             # pool
             v_emb = v.mean(dim=1)

@@ -1,9 +1,11 @@
 """WavLM-based audio encoder with two-stage finetuning support."""
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
-from transformers import WavLMModel, AutoConfig
+from transformers import WavLMConfig, WavLMModel
 
 
 class WavLMAudioEncoder(nn.Module):
@@ -18,8 +20,14 @@ class WavLMAudioEncoder(nn.Module):
         self.embedding_dim = embedding_dim
         self.model_name = model_name
         
-        # Load WavLM pretrained model
-        self.wavlm = WavLMModel.from_pretrained(model_name)
+        # Load WavLM pretrained model (with offline fallback for WSL/air-gapped envs)
+        local_files_only = os.environ.get("HF_LOCAL_ONLY", "0") == "1"
+        try:
+            self.wavlm = WavLMModel.from_pretrained(model_name, local_files_only=local_files_only)
+        except Exception as exc:
+            print(f"[WARNING] Failed to load pretrained {model_name}: {exc}")
+            print("[WARNING] Falling back to WavLM base config init; checkpoint weights will be loaded afterward.")
+            self.wavlm = WavLMModel(WavLMConfig())
         
         # Get actual hidden size from model config
         actual_hidden_size = self.wavlm.config.hidden_size
@@ -128,9 +136,15 @@ class WavLMAudioEncoder(nn.Module):
         """
         if x.dim() == 3:
             x = x.squeeze(1)  # [B, T]
-        
-        with torch.no_grad():
+
+        # Preserve efficiency when backbone is frozen, but allow gradients
+        # in fusion stage-2 when selected WavLM layers are unfrozen.
+        wavlm_trainable = any(param.requires_grad for param in self.wavlm.parameters())
+        if self.training and wavlm_trainable:
             outputs = self.wavlm(x)
+        else:
+            with torch.no_grad():
+                outputs = self.wavlm(x)
         
         hidden = outputs.last_hidden_state  # [B, T, hidden_size]
         a_emb = hidden.mean(dim=1)  # [B, hidden_size]

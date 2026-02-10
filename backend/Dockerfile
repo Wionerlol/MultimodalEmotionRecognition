@@ -2,6 +2,7 @@ FROM python:3.10-slim
 
 # Install system dependencies including ffmpeg
 RUN apt-get update && apt-get install -y \
+    curl \
     ffmpeg \
     libsm6 \
     libxext6 \
@@ -11,11 +12,12 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
+COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY app/ ./app/
+# Copy app + model source code
+COPY backend/app/ ./app/
+COPY src/ ./src/
 
 # Create temp directory for uploaded files
 RUN mkdir -p /app/tmp
@@ -24,6 +26,8 @@ RUN mkdir -p /app/tmp
 ENV PYTHONUNBUFFERED=1
 ENV USE_GPU=0
 ENV EMO_MOCK=0
+ENV HF_LOCAL_ONLY=1
+ENV PYTHONPATH=/app:/app/src
 
 # Expose port
 EXPOSE 8000

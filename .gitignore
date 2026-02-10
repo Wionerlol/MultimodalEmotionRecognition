@@ -139,6 +139,8 @@ data/Actor_*/
 data/*.mp4
 data/*.wav
 data/*.flac
+data/examples/
+data/Noise/
 
 # Weights & Biases
 wandb/

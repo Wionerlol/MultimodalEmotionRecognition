@@ -5,7 +5,7 @@ Audio-visual emotion recognition system using PyTorch and Docker. Recognizes 8 e
 ## Quick Start (Docker)
 
 ```bash
-# 1. Start services (requires Docker Desktop)
+# 1. Start services (requires Docker)
 docker compose up --build
 
 # 2. Open browser and navigate to
@@ -25,6 +25,8 @@ docker compose up --build
 ## Features
 
 - **Audio Encoder**: WavLM pretrained model with two-stage finetuning (freeze backbone → unfreeze last layers)
+- **Fusion Warm-Start**: Load `best_audio.pt` + `best_video.pt` into fusion branches for faster and stabler convergence
+- **Two-Stage Gated Fusion**: Stage-1 frozen encoders + Stage-2 selective unfreeze with layer-wise learning rates
 - **Multimodal Input**: Process both video and audio simultaneously with face detection & cropping
 - **Fusion Strategies**: Late, Concat, Gated, and Cross-Attention (xAttn) fusion methods
 - **Real Noise Augmentation**: Bar noise augmentation with SNR control (5-20 dB) using time-domain fusion
@@ -85,20 +87,20 @@ docker compose up --build
 ## Requirements
 
 ### System
-- Docker Desktop (recommended)
+- Docker Engine / Docker Desktop
 - 8GB RAM minimum
-- GPU optional (NVIDIA CUDA 13.0 for GPU acceleration)
+- GPU optional (NVIDIA CUDA in WSL2/Linux)
 
 ### Python (for local training)
 - Python 3.10+
-- CUDA 13.0 (if using GPU)
+- CUDA-enabled PyTorch (if using GPU)
 - ffmpeg (for video/audio processing)
 
 ## Installation & Setup
 
 ### Option 1: Docker (Recommended)
 
-1. **Install Docker Desktop** for your OS:
+1. **Install Docker** for your OS:
    - Windows: https://www.docker.com/products/docker-desktop
    - Mac: https://www.docker.com/products/docker-desktop
    - Linux: Follow official Docker docs
@@ -134,11 +136,12 @@ docker compose up --build
 3. **Train model** (on RAVDESS data):
    ```bash
    python src/train.py \
-     --fusion xattn \
-     --xattn_head concat \
-     --epochs 50 \
+     --data_root data \
+     --fusion gated \
+     --use_wavlm \
+     --epochs 30 \
      --batch_size 8 \
-     --early_stopping_patience 10 \
+     --early_stopping_patience 8 \
      --wandb
    ```
 
@@ -157,6 +160,20 @@ docker compose up --build
    python -m http.server 8080
    ```
    - Open `http://localhost:8080`
+   - Optional custom backend URL:
+   ```
+   http://localhost:8080/?backend=http://localhost:8000
+   ```
+
+### WSL Notes (Important)
+
+- Keep project/data in Linux filesystem when possible (`/home/<user>/...`), not `/mnt/c/...`, for better training I/O performance.
+- `src/train.py` now uses WSL-aware DataLoader defaults automatically.
+- You can override worker count manually:
+```bash
+python src/train.py --data_root data --fusion xattn --num_workers 2
+```
+- Backend now uses absolute project paths, so running from different working directories in WSL is supported.
 
 ## Usage
 
@@ -237,38 +254,59 @@ python src/train.py \
 #### With Stratified Split (Multimodal Fusion)
 
 ```bash
+# Warm-start gated fusion from trained single-modality checkpoints
 python src/train.py \
   --data_root data \
-  --fusion xattn \
-  --xattn_head concat \
-  --split_mode stratified \
+  --num_classes 8 \
+  --fusion gated \
   --use_wavlm \
-  --wavlm_stage 1 \
-  --epochs 50 \
+  --audio_ckpt outputs/best_audio.pt \
+  --video_ckpt outputs/best_video.pt \
+  --two_stage_training \
+  --stage1_epochs 5 \
+  --fusion_unfreeze_wavlm_layers 2 \
+  --fusion_unfreeze_video_blocks 1 \
+  --lr 3e-4 \
+  --audio_backbone_lr 1e-5 \
+  --video_backbone_lr 1e-5 \
+  --split_mode stratified \
+  --epochs 30 \
   --batch_size 8 \
   --weight_decay 1e-4 \
   --use_face_crop \
   --use_cosine_annealing \
-  --early_stopping_patience 10 \
+  --early_stopping_patience 8 \
   --wandb
 ```
+
+> Note: `--use_wavlm --fusion xattn` is currently not supported because xAttn expects mel-style audio tensor layout.
 
 #### Key Arguments
 
 | Argument | Default | Notes |
 |----------|---------|-------|
-| `--fusion` | `late` | `late`, `concat`, `gated`, `xattn`, `xattn_concat`, `xattn_gated` |
+| `--fusion` | `audio` | `audio`, `video`, `late`, `concat`, `gated`, `xattn`, `xattn_concat`, `xattn_gated` |
 | `--use_wavlm` | `False` | Use WavLM pretrained audio encoder (vs CNN) |
 | `--wavlm_stage` | `1` | WavLM training stage: 1 (freeze) or 2 (unfreeze) |
 | `--backbone_lr` | `3e-5` | Learning rate for WavLM backbone in stage 2 |
+| `--audio_ckpt` | `""` | Warm-start fusion audio branch from standalone audio checkpoint |
+| `--video_ckpt` | `""` | Warm-start fusion video branch from standalone video checkpoint |
+| `--two_stage_training` | `False` | Enable two-stage fusion training |
+| `--stage1_epochs` | `5` | Stage-1 epochs when two-stage fusion is enabled |
+| `--audio_backbone_lr` | `1e-5` | Stage-2 LR for audio encoder params in fusion |
+| `--video_backbone_lr` | `1e-5` | Stage-2 LR for video encoder params in fusion |
+| `--fusion_unfreeze_wavlm_layers` | `2` | Stage-2 unfreezes last N WavLM layers in fusion |
+| `--fusion_unfreeze_video_blocks` | `1` | Stage-2 unfreezes last N video backbone blocks in fusion |
+| `--fusion_unfreeze_audio` | `True` | Stage-2 unfreeze switch for non-WavLM audio encoder |
+| `--no_fusion_unfreeze_audio` | - | Keep non-WavLM audio encoder frozen in Stage-2 |
 | `--use_face_crop` | `True` | Enable face detection & cropping (default enabled) |
 | `--split_mode` | `stratified` | `actor` (by actor) or `stratified` (by emotion) |
 | `--weight_decay` | `1e-4` | L2 regularization |
 | `--early_stopping_patience` | `10` | Epochs without improvement before stopping |
 | `--use_cosine_annealing` | `False` | Use cosine annealing LR scheduler |
 | `--wandb` | `False` | Enable Weights & Biases logging |
-| `--no_train_augment` | - | Disable data augmentation (for baseline) |
 | `--no_face_crop` | - | Disable face detection & cropping |
+| `--num_workers` | `-1` | Auto-tuned for OS/WSL; set `0/1/2...` to force |
 
 ## Model Architecture
 
@@ -291,7 +329,7 @@ python src/train.py \
 
 **Option 2: WavLM (Recommended)** ⭐
 - **Backbone**: Microsoft WavLM-base (768-dim hidden)
-- **Input**: Raw waveform @ 48kHz, 3-second duration
+- **Input**: Raw waveform @ 16kHz, 3-second duration
 - **Preprocessing**: 
   - **Real Bar Noise Augmentation** (training): Time-domain fusion with 50/40/10 probability distribution:
     - 50% clean audio (original)
@@ -407,7 +445,7 @@ curl http://localhost:8001/v1/models
 - Val Accuracy: ~68-72%
 - Test Accuracy: ~68-72%
 
-**WavLM Audio + xAttn Fusion + Bar Noise Augmentation** (recommended):
+**WavLM Audio + Gated Fusion Warm-Start (recommended)**:
 - Train Accuracy: ~85-90%
 - Val Accuracy: ~72-78%
 - Test Accuracy: ~72-78%
@@ -449,8 +487,7 @@ python src/train.py \
   --wavlm_stage 1 \
   --epochs 2 \
   --batch_size 4 \
-  --use_face_crop \
-  --no_wandb
+  --use_face_crop
 ```
 
 ## Troubleshooting
@@ -496,8 +533,10 @@ Track experiments with wandb:
 ```bash
 python src/train.py \
   --wandb \
-  --fusion xattn \
-  --epochs 100 \
+  --data_root data \
+  --fusion gated \
+  --use_wavlm \
+  --epochs 30 \
   --batch_size 8
 ```
 

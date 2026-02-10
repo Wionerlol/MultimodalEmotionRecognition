@@ -4,17 +4,21 @@ services:
   # Backend API Server
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: emotion_backend
     ports:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
       - USE_GPU=0
-      - EMO_MOCK=1
+      - EMO_MOCK=0
+      - MODEL_SRC_DIR=/app/src
+      - HF_LOCAL_ONLY=1
+      - WATCHFILES_FORCE_POLLING=1
     volumes:
       - ./checkpoints:/app/checkpoints
+      - ./src:/app/src
       - ./backend/app:/app/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     healthcheck:

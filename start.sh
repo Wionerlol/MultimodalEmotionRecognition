@@ -6,10 +6,21 @@ echo "Emotion Recognition MVP Setup"
 echo "================================"
 echo ""
 
+if grep -qiE "(microsoft|wsl)" /proc/version 2>/dev/null; then
+    echo "✓ WSL environment detected"
+    case "$(pwd)" in
+        /mnt/*)
+            echo "⚠ Project is under /mnt/* (Windows filesystem)."
+            echo "  For faster training and file I/O, keep project in Linux filesystem (e.g. /home/<user>/...)."
+            ;;
+    esac
+    echo ""
+fi
+
 # Check Docker
 if ! command -v docker &> /dev/null; then
-    echo "❌ Docker is not installed. Please install Docker Desktop first:"
-    echo "   https://www.docker.com/products/docker-desktop"
+    echo "❌ Docker is not installed. Please install Docker Engine/Desktop first:"
+    echo "   https://docs.docker.com/engine/install/"
     exit 1
 fi
 

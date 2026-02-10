@@ -366,7 +366,7 @@ def load_video_frames(
     if augment:
         # Random brightness factor (darker)
         factor = float(np.random.uniform(0.2, 0.6))
-        noise_scale = float(np.random.uniform(0.0, 0.03))
+        noise_scale = float(np.random.uniform(0.0, 0.0005))
         ksize = int(np.random.choice([3, 5, 7]))
         if ksize % 2 == 0:
             ksize += 1
@@ -652,3 +652,140 @@ class RavdessAVDatasetWavLM(torch.utils.data.Dataset):
             "actor": p.actor,
         }
         return video, audio, label, meta
+
+
+class RavdessPairService:
+    """
+    Service layer around pair parsing/building so callers can depend on an object
+    instead of module-level functions.
+    """
+
+    def parse_name(self, filename: str) -> Dict[str, int]:
+        return parse_ravdess_name(filename)
+
+    def build_pairs(self, data_root: Path, vocal_channel: int = 1) -> List[PairRecord]:
+        return build_pairs(data_root=data_root, vocal_channel=vocal_channel)
+
+    def save_pairs_csv(self, pairs: Iterable[PairRecord], csv_path: Path) -> None:
+        save_pairs_csv(pairs, csv_path)
+
+    def map_emotion_label(self, emotion_id: int, num_classes: int) -> int:
+        return map_emotion_label(emotion_id, num_classes)
+
+
+class RavdessSplitService:
+    """Split strategies for train/val/test partitioning."""
+
+    def by_actor(
+        self,
+        pairs: List[PairRecord],
+        train_actors: Iterable[int],
+        val_actors: Iterable[int],
+        test_actors: Iterable[int],
+    ) -> Tuple[List[PairRecord], List[PairRecord], List[PairRecord]]:
+        return split_pairs_by_actor(pairs, train_actors, val_actors, test_actors)
+
+    def stratified(
+        self,
+        pairs: List[PairRecord],
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15,
+        test_ratio: float = 0.15,
+        seed: int = 42,
+    ) -> Tuple[List[PairRecord], List[PairRecord], List[PairRecord]]:
+        return split_pairs_stratified(
+            pairs,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+        )
+
+
+class RavdessMediaService:
+    """Media preprocessing facade used by train/eval/export scripts."""
+
+    def load_video_frames(
+        self,
+        video_path: Path,
+        num_frames: int = 8,
+        size: int = 112,
+        augment: bool = False,
+        use_face_crop: bool = True,
+    ) -> torch.Tensor:
+        return load_video_frames(
+            video_path=video_path,
+            num_frames=num_frames,
+            size=size,
+            augment=augment,
+            use_face_crop=use_face_crop,
+        )
+
+    def load_audio_mel(
+        self,
+        audio_path: Path,
+        sample_rate: int = 16000,
+        duration_sec: float = 3.0,
+        n_mels: int = 64,
+        win_length: int = 400,
+        hop_length: int = 160,
+        augment: bool = False,
+    ) -> torch.Tensor:
+        return load_audio_mel(
+            audio_path=audio_path,
+            sample_rate=sample_rate,
+            duration_sec=duration_sec,
+            n_mels=n_mels,
+            win_length=win_length,
+            hop_length=hop_length,
+            augment=augment,
+        )
+
+    def load_audio_wav(
+        self,
+        audio_path: Path,
+        sample_rate: int = 16000,
+        duration_sec: float = 3.0,
+        augment: bool = False,
+    ) -> torch.Tensor:
+        return load_audio_wav(
+            audio_path=audio_path,
+            sample_rate=sample_rate,
+            duration_sec=duration_sec,
+            augment=augment,
+        )
+
+
+class RavdessDatasetFactory:
+    """
+    Dataset factory to centralize dataset class selection and make future
+    dataset variants easier to add.
+    """
+
+    def __init__(self, media_service: Optional[RavdessMediaService] = None):
+        self.media_service = media_service or RavdessMediaService()
+
+    def create(
+        self,
+        pairs: List[PairRecord],
+        num_classes: int = 8,
+        num_frames: int = 8,
+        augment: bool = False,
+        use_face_crop: bool = True,
+        use_wavlm: bool = False,
+    ) -> torch.utils.data.Dataset:
+        dataset_cls = RavdessAVDatasetWavLM if use_wavlm else RavdessAVDataset
+        return dataset_cls(
+            pairs=pairs,
+            num_classes=num_classes,
+            num_frames=num_frames,
+            augment=augment,
+            use_face_crop=use_face_crop,
+        )
+
+
+# Default service instances for object-oriented usage.
+PAIR_SERVICE = RavdessPairService()
+SPLIT_SERVICE = RavdessSplitService()
+MEDIA_SERVICE = RavdessMediaService()
+DATASET_FACTORY = RavdessDatasetFactory(media_service=MEDIA_SERVICE)

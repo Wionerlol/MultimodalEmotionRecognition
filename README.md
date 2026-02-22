@@ -94,13 +94,14 @@ Confusion matrices (best checkpoints or representative runs):
 
 ### 3) Custom Model Architecture Diagram
 
-Recommended path:
-- `assets/diagrams/model_architecture_overview.png`
+Unimodal ( audio / video )
 
 ![Model Architecture Diagram](assets/diagrams/model_architecture_overview.png)
 
-Optional caption template:
-> Figure: Your custom architecture diagram (replace with final version exported from your drawing tool).
+Multimodal ( gated / cross-attention fusion )
+
+![Model Architecture Diagram](assets/diagrams/model_architecture_overview_2.png)
+
 
 ## Project Structure
 

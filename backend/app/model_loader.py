@@ -92,8 +92,16 @@ class ModelLoaderService:
             k.startswith("wavlm.") for k in state_dict
         )
 
-    def build_model(self, num_classes: int, fusion_mode: str, xattn_head: str, use_wavlm: bool) -> nn.Module:
+    def build_model(
+        self,
+        num_classes: int,
+        fusion_mode: str,
+        xattn_head: str,
+        use_wavlm: bool,
+        config: Optional[Dict[str, object]] = None,
+    ) -> nn.Module:
         self.ensure_src_import_path()
+        config = config or {}
         try:
             from models.audio import AudioNet
             from models.fusion import FusionModel
@@ -107,18 +115,60 @@ class ModelLoaderService:
 
         if fusion_mode == "audio":
             if use_wavlm:
-                return WavLMAudioEncoder(num_classes=num_classes)
-            return AudioNet(num_classes=num_classes, use_resnet=True, spec_augment=False)
+                return WavLMAudioEncoder(
+                    num_classes=num_classes,
+                    temporal_pooling=str(config.get("temporal_pooling", "mean")),
+                    temporal_num_heads=int(config.get("temporal_num_heads", 4)),
+                    temporal_num_layers=int(config.get("temporal_num_layers", 1)),
+                    temporal_dropout=float(config.get("temporal_dropout", 0.1)),
+                )
+            return AudioNet(
+                num_classes=num_classes,
+                use_resnet=bool(config.get("use_resnet_audio", True)),
+                spec_augment=False,
+                temporal_pooling=str(config.get("temporal_pooling", "mean")),
+                temporal_num_heads=int(config.get("temporal_num_heads", 4)),
+                temporal_num_layers=int(config.get("temporal_num_layers", 1)),
+                temporal_dropout=float(config.get("temporal_dropout", 0.1)),
+            )
         if fusion_mode == "video":
-            return VideoNet(num_classes=num_classes, pretrained=False)
+            return VideoNet(
+                num_classes=num_classes,
+                pretrained=False,
+                temporal_pooling=str(config.get("temporal_pooling", "mean")),
+                temporal_num_heads=int(config.get("temporal_num_heads", 4)),
+                temporal_num_layers=int(config.get("temporal_num_layers", 1)),
+                temporal_dropout=float(config.get("temporal_dropout", 0.1)),
+            )
 
         if use_wavlm:
-            audio = WavLMAudioEncoder(num_classes=num_classes)
+            audio = WavLMAudioEncoder(
+                num_classes=num_classes,
+                temporal_pooling=str(config.get("temporal_pooling", "mean")),
+                temporal_num_heads=int(config.get("temporal_num_heads", 4)),
+                temporal_num_layers=int(config.get("temporal_num_layers", 1)),
+                temporal_dropout=float(config.get("temporal_dropout", 0.1)),
+            )
             audio_n_mels = 768
         else:
-            audio = AudioNet(num_classes=num_classes, use_resnet=True, spec_augment=False)
-            audio_n_mels = 64
-        video = VideoNet(num_classes=num_classes, pretrained=False)
+            audio = AudioNet(
+                num_classes=num_classes,
+                use_resnet=bool(config.get("use_resnet_audio", True)),
+                spec_augment=False,
+                temporal_pooling=str(config.get("temporal_pooling", "mean")),
+                temporal_num_heads=int(config.get("temporal_num_heads", 4)),
+                temporal_num_layers=int(config.get("temporal_num_layers", 1)),
+                temporal_dropout=float(config.get("temporal_dropout", 0.1)),
+            )
+            audio_n_mels = int(config.get("audio_n_mels", 64))
+        video = VideoNet(
+            num_classes=num_classes,
+            pretrained=False,
+            temporal_pooling=str(config.get("temporal_pooling", "mean")),
+            temporal_num_heads=int(config.get("temporal_num_heads", 4)),
+            temporal_num_layers=int(config.get("temporal_num_layers", 1)),
+            temporal_dropout=float(config.get("temporal_dropout", 0.1)),
+        )
         return FusionModel(
             audio_model=audio,
             video_model=video,
@@ -126,6 +176,14 @@ class ModelLoaderService:
             mode=fusion_mode,
             xattn_head=xattn_head,
             audio_n_mels=audio_n_mels,
+            d_model=int(config.get("xattn_d_model", 128)),
+            num_heads=int(config.get("xattn_heads", 4)),
+            xattn_attn_dropout=float(config.get("xattn_attn_dropout", 0.1)),
+            xattn_stochastic_depth=float(config.get("xattn_stochastic_depth", 0.1)),
+            temporal_pooling=str(config.get("temporal_pooling", "mean")),
+            temporal_num_heads=int(config.get("temporal_num_heads", 4)),
+            temporal_num_layers=int(config.get("temporal_num_layers", 1)),
+            temporal_dropout=float(config.get("temporal_dropout", 0.1)),
         )
 
     def load_model_from_checkpoint(self, checkpoint_path: Path, num_classes: int = 8) -> Optional[nn.Module]:
@@ -136,6 +194,7 @@ class ModelLoaderService:
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+            config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
             env_mode = os.environ.get("MODEL_FUSION", "").strip().lower()
             env_head = os.environ.get("MODEL_XATTN_HEAD", "concat").strip().lower()
             use_wavlm = self.checkpoint_uses_wavlm(state_dict)
@@ -150,6 +209,7 @@ class ModelLoaderService:
                 fusion_mode=fusion_mode,
                 xattn_head=xattn_head,
                 use_wavlm=use_wavlm,
+                config=config,
             )
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if unexpected:
@@ -161,7 +221,8 @@ class ModelLoaderService:
                 )
             print(
                 f"[INFO] Loaded checkpoint with fusion_mode={fusion_mode}, "
-                f"xattn_head={xattn_head}, use_wavlm={use_wavlm}"
+                f"xattn_head={xattn_head}, use_wavlm={use_wavlm}, "
+                f"temporal_pooling={config.get('temporal_pooling', 'mean')}"
             )
             adapted_model = _InferenceModelAdapter(model, fusion_mode)
             adapted_model.requires_wavlm = use_wavlm
@@ -201,12 +262,19 @@ def _checkpoint_uses_wavlm(state_dict: Dict[str, torch.Tensor]) -> bool:
     return MODEL_LOADER_SERVICE.checkpoint_uses_wavlm(state_dict)
 
 
-def _build_model(num_classes: int, fusion_mode: str, xattn_head: str, use_wavlm: bool) -> nn.Module:
+def _build_model(
+    num_classes: int,
+    fusion_mode: str,
+    xattn_head: str,
+    use_wavlm: bool,
+    config: Optional[Dict[str, object]] = None,
+) -> nn.Module:
     return MODEL_LOADER_SERVICE.build_model(
         num_classes=num_classes,
         fusion_mode=fusion_mode,
         xattn_head=xattn_head,
         use_wavlm=use_wavlm,
+        config=config,
     )
 
 

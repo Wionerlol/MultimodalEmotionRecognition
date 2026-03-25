@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import librosa
@@ -201,10 +201,55 @@ class EmotionPreprocessService:
             frames.extend([frames[-1]] * (num_frames - len(frames)))
 
         frames_np = np.stack(frames[:num_frames], axis=0).astype(np.float32) / 255.0
+        return self.normalize_video_frames(frames_np)
+
+    @staticmethod
+    def normalize_video_frames(frames_np: np.ndarray) -> torch.Tensor:
+        """Normalize RGB frames [T, H, W, 3] and return [T, 3, H, W]."""
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         frames_np = (frames_np - mean) / std
         return torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # [T, 3, H, W]
+
+    def load_video_frames_from_memory(
+        self,
+        frames: Sequence[np.ndarray],
+        num_frames: int = FRAMES,
+        size: int = IMG_SIZE,
+        use_face_crop: bool = True,
+    ) -> torch.Tensor:
+        """Preprocess an in-memory list of RGB/BGR frames into model-ready video."""
+        if not frames:
+            zeros = np.zeros((num_frames, size, size, 3), dtype=np.float32)
+            return self.normalize_video_frames(zeros)
+
+        indices = self.uniform_indices(len(frames), num_frames)
+        selected = [frames[idx] for idx in indices]
+        processed: List[np.ndarray] = []
+        bbox = None
+
+        for frame in selected:
+            if frame.ndim != 3 or frame.shape[2] != 3:
+                continue
+            frame_bgr = frame
+            if use_face_crop and bbox is None:
+                bbox = self.detect_face_bbox(frame_bgr)
+                if bbox is not None:
+                    frame_bgr = self.crop_with_padding(frame_bgr, bbox, pad_ratio=0.3)
+            elif use_face_crop and bbox is not None:
+                frame_bgr = self.crop_with_padding(frame_bgr, bbox, pad_ratio=0.3)
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_rgb = cv2.resize(frame_rgb, (size, size), interpolation=cv2.INTER_LINEAR)
+            processed.append(frame_rgb)
+
+        if not processed:
+            processed = [np.zeros((size, size, 3), dtype=np.uint8) for _ in range(num_frames)]
+        if len(processed) < num_frames:
+            processed.extend([processed[-1]] * (num_frames - len(processed)))
+
+        frames_np = np.stack(processed[:num_frames], axis=0).astype(np.float32) / 255.0
+        return self.normalize_video_frames(frames_np)
 
     def load_audio_mel(
         self,
@@ -251,6 +296,60 @@ class EmotionPreprocessService:
         elif wav.size(1) > target_len:
             wav = wav[:, :target_len]
         return wav
+
+    def prepare_audio_waveform(
+        self,
+        waveform: np.ndarray,
+        sample_rate: int,
+        duration_sec: float = RECORD_SECONDS,
+    ) -> torch.Tensor:
+        """Normalize, resample, and pad/crop in-memory waveform to target length."""
+        waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
+        if waveform.size == 0:
+            waveform = np.zeros(1, dtype=np.float32)
+
+        if sample_rate != self.sample_rate:
+            waveform = librosa.resample(
+                waveform,
+                orig_sr=sample_rate,
+                target_sr=self.sample_rate,
+            ).astype(np.float32)
+
+        wav = torch.from_numpy(waveform).float().unsqueeze(0)
+        target_len = int(self.sample_rate * duration_sec)
+        if wav.size(1) < target_len:
+            wav = torch.nn.functional.pad(wav, (0, target_len - wav.size(1)))
+        elif wav.size(1) > target_len:
+            wav = wav[:, -target_len:]
+        return wav
+
+    def load_audio_mel_from_waveform(
+        self,
+        waveform: np.ndarray,
+        sample_rate: int,
+        duration_sec: float = RECORD_SECONDS,
+        n_mels: int = N_MELS,
+        win_length: int = WIN_LENGTH,
+        hop_length: int = HOP_LENGTH,
+    ) -> torch.Tensor:
+        """Build log-mel spectrogram from in-memory waveform."""
+        wav = self.prepare_audio_waveform(waveform, sample_rate=sample_rate, duration_sec=duration_sec)
+        mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.sample_rate,
+            n_mels=n_mels,
+            win_length=win_length,
+            hop_length=hop_length,
+        )(wav)
+        return torchaudio.transforms.AmplitudeToDB()(mel)
+
+    def load_audio_wav_from_waveform(
+        self,
+        waveform: np.ndarray,
+        sample_rate: int,
+        duration_sec: float = RECORD_SECONDS,
+    ) -> torch.Tensor:
+        """Prepare in-memory waveform for WavLM-based inference."""
+        return self.prepare_audio_waveform(waveform, sample_rate=sample_rate, duration_sec=duration_sec)
 
     def extract_audio_from_video(self, video_path: str) -> str:
         """
@@ -308,6 +407,35 @@ class EmotionPreprocessService:
                 os.remove(audio_path)
 
         return video, audio
+
+    def preprocess_stream_window(
+        self,
+        frames: Sequence[np.ndarray],
+        waveform: np.ndarray,
+        waveform_sample_rate: int,
+        use_face_crop: bool = True,
+        use_wavlm: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Preprocess in-memory sliding window buffers for streaming inference."""
+        video = self.load_video_frames_from_memory(
+            frames,
+            num_frames=self.frames,
+            size=self.img_size,
+            use_face_crop=use_face_crop,
+        ).unsqueeze(0)
+        if use_wavlm:
+            audio = self.load_audio_wav_from_waveform(
+                waveform,
+                sample_rate=waveform_sample_rate,
+                duration_sec=self.record_seconds,
+            )
+        else:
+            audio = self.load_audio_mel_from_waveform(
+                waveform,
+                sample_rate=waveform_sample_rate,
+                duration_sec=self.record_seconds,
+            )
+        return video, audio.unsqueeze(0)
 
 
 PREPROCESS_SERVICE = EmotionPreprocessService()

@@ -140,13 +140,19 @@
 ### B) `concat`
 
 - 分别编码 `a_emb`、`v_emb`
+- 默认先做各自时间聚合：
+  - audio/video 分支都支持 `mean / attn / transformer` 三种 temporal pooling
 - 投影到共同维度 `common_dim=256`
+- 可选：在投影前加入 `CLIP-style semantic alignment`
+  - 将音频/视频 embedding 先投影到共享语义空间
+  - 训练时附加对比损失
 - 拼接后 MLP：
   - `Linear(512 -> 256) -> ReLU -> Dropout(0.2) -> Linear(256 -> num_classes)`
 
 ### C) `gated`
 
-- 与 `concat` 一样先投影
+- 与 `concat` 一样先编码、做 temporal pooling、再投影
+- 同样支持可选 `CLIP-style semantic alignment`
 - `ModalityDropout`（音频/视频各 `p=0.2`）
 - 门控网络：
   - `Linear(512 -> 256) -> ReLU -> Dropout(0.2) -> Linear(256 -> 1) -> Sigmoid`
@@ -171,10 +177,14 @@
 - `v2a_attn(query=v, key=a, value=a, dropout=xattn_attn_dropout)` + 残差层归一化
 - `a2v_attn(query=a, key=v, value=v, dropout=xattn_attn_dropout)` + 残差层归一化
 - 残差分支支持 `StochasticDepth(drop_prob=xattn_stochastic_depth)`
+- 可选 `emotion prior bias`：
+  - 先从全局音视频表示构造 emotion prior
+  - 再为 query token / key token 生成 token-wise bias
+  - 实际注入形式：`softmax(QK^T + bias_emotion)`
 
 池化与头部：
 
-- 时间维平均得到 `v_emb/a_emb`
+- 时间维聚合支持 `mean / attn / transformer`
 - `xattn_head=concat`：
   - `Linear(2*d_model -> 256) -> ReLU -> Linear(256 -> num_classes)`
 - `xattn_head=gated`：
@@ -195,6 +205,9 @@
 
 - `fusion == "late"`：`NLLLoss`（因为模型输出概率，训练前取 `log`）
 - 其他模式：`CrossEntropyLoss(label_smoothing=label_smoothing)`
+- 若 `concat/gated` 开启 `fusion_align_mode=clip`：
+  - 总损失 = `classification_loss + fusion_align_weight * contrastive_loss`
+  - 训练日志会分别记录 `loss / cls_loss / contrastive_loss`
 
 ### 4.3 优化器与调度器
 
@@ -229,6 +242,14 @@
   - `--no_fusion_unfreeze_audio`
   - `--xattn_attn_dropout`
   - `--xattn_stochastic_depth`
+  - `--xattn_use_emotion_prior`
+  - `--xattn_emotion_prior_dim`
+  - `--xattn_emotion_prior_hidden_dim`
+  - `--xattn_emotion_prior_dropout`
+  - `--fusion_align_mode`
+  - `--fusion_align_dim`
+  - `--fusion_align_temperature`
+  - `--fusion_align_weight`
   - `--label_smoothing`
 - 行为：
   - 在构建融合模型后，将 checkpoint 分别加载到 `audio_model` / `video_model`
@@ -258,6 +279,12 @@
 ## 5. 参数规模（按当前代码实测）
 
 统计方式：`sum(p.numel())`。  
+
+补充说明：
+
+- 开启 `CLIP-style semantic alignment` 会为 `concat/gated` 额外引入共享投影层
+- 开启 `emotion prior bias` 会为 `xattn` 额外引入一个小型 MLP 和若干 token-bias 头
+- 相比 backbone，本项目新增模块的主要额外开销仍然集中在融合层而非音视频主干
 下表为 `num_classes=8`，`pretrained_video=False`（仅影响初始化，不影响参数量）。
 
 ### 5.1 非 WavLM（音频编码器为 AudioResNet18）

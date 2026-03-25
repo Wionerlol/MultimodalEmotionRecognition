@@ -123,6 +123,38 @@ uv run python src/train.py \
   xattn:    交叉注意力（高级）
 ```
 
+### 融合前语义对齐
+```bash
+--fusion_align_mode {none,clip}
+                            # 仅对 concat / gated 生效
+                            # clip: 先做 CLIP 风格共享语义空间对齐，再融合
+--fusion_align_dim 256      # 对齐空间维度
+--fusion_align_temperature 0.07
+                            # 对比学习初始温度
+--fusion_align_weight 0.1   # 对齐损失权重
+```
+
+### xAttn Attention 改进
+```bash
+--xattn_use_emotion_prior
+                            # 在 xattn 中启用 emotion-prior-conditioned attention bias
+--xattn_emotion_prior_dim 8
+                            # 全局 emotion prior 的维度，可设为 8 / 32 / 64
+--xattn_emotion_prior_hidden_dim 64
+                            # emotion prior 模块内部隐藏层维度
+--xattn_emotion_prior_dropout 0.1
+                            # emotion prior 模块 dropout
+```
+
+### Temporal Modeling
+```bash
+--temporal_pooling {mean,attn,transformer}
+                            # 单模态与 xattn 后聚合方式
+--temporal_num_heads 4
+--temporal_num_layers 1
+--temporal_dropout 0.1
+```
+
 ### 训练策略
 ```bash
 --use_cosine_annealing      # 余弦退火调度器（推荐）
@@ -149,6 +181,31 @@ uv run python src/train.py \
 --epochs 20
 --batch_size 16
 --early_stopping_patience 10
+```
+
+建议补充消融：
+
+```bash
+# 验证 temporal pooling
+--temporal_pooling mean
+# 或
+--temporal_pooling attn
+# 或
+--temporal_pooling transformer
+```
+
+```bash
+# 验证 concat/gated 前的 CLIP-style alignment
+--fusion gated
+--fusion_align_mode clip
+--fusion_align_weight 0.1
+```
+
+```bash
+# 验证 xattn 中的 emotion prior bias
+--fusion xattn
+--xattn_use_emotion_prior
+--xattn_emotion_prior_dim 8
 ```
 
 ### 第三周最终报告
@@ -192,9 +249,11 @@ uv run python src/train.py \
 
 关键指标:
 1. **train/loss, val/loss**: 收敛性
-2. **train/f1, val/f1**: 主要指标（Macro-F1）
-3. **train/acc, val/acc**: 准确率（辅助）
-4. **lr**: 学习率衰减曲线
+2. **train/cls_loss, val/cls_loss**: 分类目标是否稳定下降
+3. **train/contrastive_loss, val/contrastive_loss**: 开启 CLIP 时重点观察
+4. **train/f1, val/f1**: 主要指标（Macro-F1）
+5. **train/acc, val/acc**: 准确率（辅助）
+6. **lr**: 学习率衰减曲线
 
 ### 理想的训练曲线
 ```

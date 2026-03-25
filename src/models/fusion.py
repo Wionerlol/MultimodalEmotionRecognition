@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
+
+from .temporal import TemporalPooler
 
 
 class StochasticDepth(nn.Module):
@@ -120,6 +124,66 @@ class GatedFusion(nn.Module):
         return self.classifier(fused)
 
 
+class ClipStyleAlignment(nn.Module):
+    """Project audio/video embeddings into a shared space with CLIP-style contrastive loss."""
+
+    def __init__(self, audio_dim: int, video_dim: int, align_dim: int, init_temperature: float = 0.07) -> None:
+        super().__init__()
+        self.audio_proj = nn.Linear(audio_dim, align_dim)
+        self.video_proj = nn.Linear(video_dim, align_dim)
+        safe_temp = max(float(init_temperature), 1e-3)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / safe_temp), dtype=torch.float32))
+
+    def forward(self, audio_emb: torch.Tensor, video_emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        a_aligned = self.audio_proj(audio_emb)
+        v_aligned = self.video_proj(video_emb)
+
+        a_norm = nn.functional.normalize(a_aligned, dim=-1)
+        v_norm = nn.functional.normalize(v_aligned, dim=-1)
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        logits = scale * (a_norm @ v_norm.t())
+        targets = torch.arange(logits.size(0), device=logits.device)
+        loss = 0.5 * (
+            nn.functional.cross_entropy(logits, targets) +
+            nn.functional.cross_entropy(logits.t(), targets)
+        )
+        return a_aligned, v_aligned, loss
+
+
+class EmotionPriorBiasAdapter(nn.Module):
+    """Build a global emotion prior and turn it into token-wise attention bias."""
+
+    def __init__(self, token_dim: int, prior_dim: int, hidden_dim: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.prior_net = nn.Sequential(
+            nn.Linear(token_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, prior_dim),
+        )
+        self.v_query_bias = nn.Linear(token_dim + prior_dim, 1)
+        self.a_key_bias = nn.Linear(token_dim + prior_dim, 1)
+        self.a_query_bias = nn.Linear(token_dim + prior_dim, 1)
+        self.v_key_bias = nn.Linear(token_dim + prior_dim, 1)
+        self.bias_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+    def _token_bias(self, query: torch.Tensor, key: torch.Tensor, prior: torch.Tensor, query_head: nn.Linear, key_head: nn.Linear) -> torch.Tensor:
+        q_prior = prior.unsqueeze(1).expand(-1, query.size(1), -1)
+        k_prior = prior.unsqueeze(1).expand(-1, key.size(1), -1)
+        q_scores = query_head(torch.cat([query, q_prior], dim=-1)).squeeze(-1)
+        k_scores = key_head(torch.cat([key, k_prior], dim=-1)).squeeze(-1)
+        bias = q_scores.unsqueeze(-1) + k_scores.unsqueeze(-2)
+        return torch.tanh(bias) * self.bias_scale
+
+    def forward(self, video_tokens: torch.Tensor, audio_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        video_global = video_tokens.mean(dim=1)
+        audio_global = audio_tokens.mean(dim=1)
+        prior = self.prior_net(torch.cat([video_global, audio_global], dim=-1))
+        v2a_bias = self._token_bias(video_tokens, audio_tokens, prior, self.v_query_bias, self.a_key_bias)
+        a2v_bias = self._token_bias(audio_tokens, video_tokens, prior, self.a_query_bias, self.v_key_bias)
+        return prior, v2a_bias, a2v_bias
+
+
 class FusionModel(nn.Module):
     def __init__(
         self,
@@ -135,6 +199,17 @@ class FusionModel(nn.Module):
         audio_n_mels: int = 64,
         xattn_attn_dropout: float = 0.1,
         xattn_stochastic_depth: float = 0.1,
+        temporal_pooling: str = "mean",
+        temporal_num_heads: int = 4,
+        temporal_num_layers: int = 1,
+        temporal_dropout: float = 0.1,
+        fusion_align_mode: str = "none",
+        fusion_align_dim: int = 256,
+        fusion_align_temperature: float = 0.07,
+        xattn_use_emotion_prior: bool = False,
+        xattn_emotion_prior_dim: int = 8,
+        xattn_emotion_prior_hidden_dim: int = 64,
+        xattn_emotion_prior_dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.audio_model = audio_model
@@ -143,10 +218,27 @@ class FusionModel(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.audio_n_mels = audio_n_mels
+        self.fusion_align_mode = fusion_align_mode
+        self.alignment_loss = None
+        self.semantic_alignment = None
+        self.xattn_use_emotion_prior = xattn_use_emotion_prior
 
         if mode in {"concat", "gated"}:
-            self.audio_proj = nn.Linear(audio_model.embedding_dim, common_dim)
-            self.video_proj = nn.Linear(video_model.embedding_dim, common_dim)
+            fusion_audio_dim = audio_model.embedding_dim
+            fusion_video_dim = video_model.embedding_dim
+            if fusion_align_mode == "clip":
+                self.semantic_alignment = ClipStyleAlignment(
+                    audio_dim=audio_model.embedding_dim,
+                    video_dim=video_model.embedding_dim,
+                    align_dim=fusion_align_dim,
+                    init_temperature=fusion_align_temperature,
+                )
+                fusion_audio_dim = fusion_align_dim
+                fusion_video_dim = fusion_align_dim
+            else:
+                self.semantic_alignment = None
+            self.audio_proj = nn.Linear(fusion_audio_dim, common_dim)
+            self.video_proj = nn.Linear(fusion_video_dim, common_dim)
             if mode == "concat":
                 self.fusion = nn.Sequential(
                     nn.Linear(common_dim * 2, common_dim),
@@ -191,6 +283,29 @@ class FusionModel(nn.Module):
             self.a_drop_path = StochasticDepth(drop_prob=xattn_stochastic_depth)
             self.v_norm = nn.LayerNorm(d_model)
             self.a_norm = nn.LayerNorm(d_model)
+            if xattn_use_emotion_prior:
+                self.emotion_prior_bias = EmotionPriorBiasAdapter(
+                    token_dim=d_model,
+                    prior_dim=xattn_emotion_prior_dim,
+                    hidden_dim=xattn_emotion_prior_hidden_dim,
+                    dropout=xattn_emotion_prior_dropout,
+                )
+            else:
+                self.emotion_prior_bias = None
+            self.v_temporal_pool = TemporalPooler(
+                dim=d_model,
+                mode=temporal_pooling,
+                num_heads=temporal_num_heads,
+                num_layers=temporal_num_layers,
+                dropout=temporal_dropout,
+            )
+            self.a_temporal_pool = TemporalPooler(
+                dim=d_model,
+                mode=temporal_pooling,
+                num_heads=temporal_num_heads,
+                num_layers=temporal_num_layers,
+                dropout=temporal_dropout,
+            )
             # fusion head
             self.xattn_head = xattn_head
             if xattn_head == "concat":
@@ -228,7 +343,18 @@ class FusionModel(nn.Module):
                     if layer != self.xattn_gate[-1]:
                         layer.bias.fill_(-1.0)
 
+    def pop_alignment_loss(self) -> torch.Tensor | None:
+        loss = self.alignment_loss
+        self.alignment_loss = None
+        return loss
+
+    def _expand_attn_bias(self, bias: torch.Tensor | None) -> torch.Tensor | None:
+        if bias is None:
+            return None
+        return bias.repeat_interleave(self.num_heads, dim=0)
+
     def forward(self, video: torch.Tensor, audio: torch.Tensor):
+        self.alignment_loss = None
         if self.mode == "late":
             a_logits = self.audio_model(audio)
             v_logits = self.video_model(video)
@@ -259,17 +385,21 @@ class FusionModel(nn.Module):
             # project audio (a_dim -> d_model)
             a = self.a_in_proj(a_seq)
 
+            v2a_bias = None
+            a2v_bias = None
+            if self.emotion_prior_bias is not None:
+                _, v2a_bias, a2v_bias = self.emotion_prior_bias(v, a)
+
             # cross-attention: v2 = MHA(query=v, key=a, value=a)
-            v2, _ = self.v2a_attn(query=v, key=a, value=a)
+            v2, _ = self.v2a_attn(query=v, key=a, value=a, attn_mask=self._expand_attn_bias(v2a_bias))
             v = self.v_norm(v + self.v_drop_path(v2))
 
             # a2 = MHA(query=a, key=v, value=v)
-            a2, _ = self.a2v_attn(query=a, key=v, value=v)
+            a2, _ = self.a2v_attn(query=a, key=v, value=v, attn_mask=self._expand_attn_bias(a2v_bias))
             a = self.a_norm(a + self.a_drop_path(a2))
 
-            # pool
-            v_emb = v.mean(dim=1)
-            a_emb = a.mean(dim=1)
+            v_emb = self.v_temporal_pool(v)
+            a_emb = self.a_temporal_pool(a)
 
             # fusion head
             if self.xattn_head == "concat":
@@ -283,6 +413,9 @@ class FusionModel(nn.Module):
         # default (non-xattn) behavior: use existing audio/video encoders + simple fusion
         a_emb = self.audio_model.encode(audio)
         v_emb = self.video_model.encode(video)
+
+        if self.mode in {"concat", "gated"} and self.semantic_alignment is not None:
+            a_emb, v_emb, self.alignment_loss = self.semantic_alignment(a_emb, v_emb)
 
         if self.mode in {"concat", "gated"}:
             a_emb = self.audio_proj(a_emb)

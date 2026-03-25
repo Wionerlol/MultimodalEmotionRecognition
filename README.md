@@ -76,6 +76,15 @@ Audio-Visual Emotion Recognition using Deep Learning and Cross-Modal Fusion
 - 学习 audio-visual correlation
 - 在实验中优于简单 concat 或 late fusion
 
+进一步扩展：
+
+- 支持在 cross-attention 后继续做 temporal pooling / temporal transformer 聚合
+- 支持加入 emotion-prior-conditioned attention bias：
+  - 先由全局音视频表示生成 emotion prior
+  - 再为 query / key token 生成 token-wise bias
+  - 注意力形式为 `softmax(QK^T + bias_emotion)`
+- 该模块与主体 attention 解耦，可通过超参数独立开关
+
 ### 3. Curriculum Learning 噪声增强策略（Research 级）
 
 实现真实环境噪声训练：
@@ -126,6 +135,56 @@ Stage 2:
 用于研究：
 
 - 不同 fusion strategy 的性能差异
+- temporal modeling 是否优于简单 mean pooling
+- 语义对齐模块是否能帮助融合前表征统一
+- attention bias / prior 机制是否能改善跨模态交互
+
+### 5.1 Temporal Modeling 尝试
+
+在单模态与多模态分支都实现了可切换的时序建模模块：
+
+- `mean pooling`
+- `temporal attention pooling`
+- `temporal transformer pooling`
+
+当前实验结论：
+
+- 对 `audio-only + WavLM`，`attention pooling` 与 `mean pooling` 基本持平
+- `temporal transformer` 在 audio / video 分支上都没有稳定带来收益
+- 在 `xattn` 后把 `mean pooling` 换成 `temporal transformer`，最终性能基本不变，但过拟合更明显
+- 当前数据规模下，`mean pooling` 仍然是最稳健的默认方案
+
+### 5.2 CLIP-style Semantic Alignment 尝试
+
+在 `concat / gated fusion` 前实现了可选的 CLIP-style 语义对齐模块：
+
+- 先把音频和视频 embedding 投影到共享语义空间
+- 使用“分类损失 + 对比损失加权”进行联合训练
+- 再送入后续 `concat` 或 `gated` 融合头
+
+当前实验现象：
+
+- 在 `gated fusion` 上，对比损失较难压低
+- 加入 CLIP-style alignment 后，分类损失略高于不加 CLIP 的 baseline
+
+当前判断：
+
+- 小 batch / 小数据条件下，instance-level 对比目标较难优化
+- 对比目标与分类目标可能存在一定冲突，因此当前不作为默认方案
+
+### 5.3 Attention 改进尝试
+
+除标准双向 cross-attention 外，当前仓库还支持：
+
+- emotion prior bias for xAttn
+  - 使用全局音视频表示构造 emotion prior
+  - 对每个 query token 和 key token 生成偏置矩阵
+  - 以可插拔模块方式注入现有 attention，不改动主干接口
+
+该设计主要用于验证：
+
+- 全局情绪先验是否能帮助 token-level 跨模态对齐
+- 是否可以在不显著增加主干复杂度的前提下改进 attention 质量
 
 ### 6. 完整推理与部署系统
 
@@ -146,6 +205,10 @@ Deployment:
 API：
 
 - `POST /predict`
+- `POST /predict_batch`
+- `POST /submit`
+- `GET /result/{task_id}`
+- `GET /queue/status`
 
 返回示例：
 
@@ -155,6 +218,77 @@ API：
   "prob": 0.82
 }
 ```
+
+批量 / 队列推理：
+
+- 服务端改为 Redis 队列网关，请求写入 Redis，worker 独立消费
+- 支持跨进程 / 跨机器扩展多个推理 worker
+- 通过环境变量控制：
+  - `EMO_REDIS_URL`
+  - `EMO_BATCH_SIZE`
+  - `EMO_BATCH_TIMEOUT_MS`
+  - `EMO_WORKER_COUNT`
+  - `EMO_PREPROCESS_WORKERS`
+
+启动示例：
+
+```bash
+redis-server
+
+EMO_REDIS_URL=redis://localhost:6379/0 \
+EMO_CHECKPOINT=outputs/best_xattn.pt \
+EMO_BATCH_SIZE=8 \
+EMO_BATCH_TIMEOUT_MS=20 \
+EMO_WORKER_COUNT=1 \
+python3 src/inference_worker.py
+
+EMO_REDIS_URL=redis://localhost:6379/0 \
+EMO_CHECKPOINT=outputs/best_xattn.pt \
+python3 src/inference_server.py
+```
+
+模型压缩 / 加速：
+
+- 导出 ONNX：
+
+```bash
+python3 src/export_optimized_model.py \
+  --checkpoint outputs/best_xattn.pt \
+  --output outputs/best_xattn.onnx
+```
+
+- 导出 INT8 ONNX：
+
+```bash
+python3 src/export_optimized_model.py \
+  --checkpoint outputs/best_xattn.pt \
+  --output outputs/best_xattn.onnx \
+  --quantize_int8
+```
+
+- CPU 动态量化推理：
+
+```bash
+EMO_ENABLE_DYNAMIC_QUANT=1 \
+EMO_INFERENCE_BACKEND=torch \
+python3 src/inference_worker.py
+```
+
+- ONNX Runtime 推理：
+
+```bash
+EMO_INFERENCE_BACKEND=onnx \
+EMO_ONNX_MODEL_PATH=outputs/best_xattn_int8.onnx \
+python3 src/inference_worker.py
+```
+
+当前支持的推理优化手段：
+
+- Redis queue + batch worker 的并行推理架构
+- ONNX 导出
+- ONNX Runtime 推理
+- ONNX INT8 动态量化导出
+- PyTorch CPU 动态量化（`Linear` 层）
 
 ## 系统架构图
 

@@ -7,6 +7,8 @@ import torch
 from torch import nn
 from transformers import WavLMConfig, WavLMModel
 
+from .temporal import TemporalPooler
+
 
 class WavLMAudioEncoder(nn.Module):
     """WavLM audio encoder with two-stage finetuning strategy.
@@ -14,7 +16,16 @@ class WavLMAudioEncoder(nn.Module):
     Stage 1: Freeze backbone, only train classifier head (epochs 5-10, lr=1e-3)
     Stage 2: Unfreeze last 2-4 layers, continue training (epochs 5-10, backbone lr=1e-5~3e-5, head lr=1e-4~3e-4)
     """
-    def __init__(self, num_classes: int, embedding_dim: int = 768, model_name: str = "microsoft/wavlm-base"):
+    def __init__(
+        self,
+        num_classes: int,
+        embedding_dim: int = 768,
+        model_name: str = "microsoft/wavlm-base",
+        temporal_pooling: str = "mean",
+        temporal_num_heads: int = 4,
+        temporal_num_layers: int = 1,
+        temporal_dropout: float = 0.1,
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.embedding_dim = embedding_dim
@@ -32,6 +43,13 @@ class WavLMAudioEncoder(nn.Module):
         # Get actual hidden size from model config
         actual_hidden_size = self.wavlm.config.hidden_size
         self.sequence_dim = actual_hidden_size
+        self.temporal_pool = TemporalPooler(
+            dim=actual_hidden_size,
+            mode=temporal_pooling,
+            num_heads=temporal_num_heads,
+            num_layers=temporal_num_layers,
+            dropout=temporal_dropout,
+        )
         
         # Classification head
         self.classifier = nn.Sequential(
@@ -117,9 +135,8 @@ class WavLMAudioEncoder(nn.Module):
         outputs = self.wavlm(x)
         
         # outputs.last_hidden_state: [B, T, hidden_size]
-        # Mean pooling over time
         hidden = outputs.last_hidden_state  # [B, T, H]
-        a_emb = hidden.mean(dim=1)  # [B, H]
+        a_emb = self.temporal_pool(hidden)  # [B, H]
         
         # Classification
         logits = self.classifier(a_emb)  # [B, num_classes]
@@ -136,7 +153,7 @@ class WavLMAudioEncoder(nn.Module):
             Embedding [B, embedding_dim]
         """
         hidden = self.encode_sequence(x)
-        a_emb = hidden.mean(dim=1)  # [B, hidden_size]
+        a_emb = self.temporal_pool(hidden)  # [B, hidden_size]
         
         # Project to embedding_dim if needed
         if a_emb.size(-1) != self.embedding_dim:

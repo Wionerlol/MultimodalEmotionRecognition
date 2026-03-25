@@ -11,3 +11,6 @@ scipy==1.11.4
 matplotlib==3.8.2
 pillow==10.1.0
 transformers==4.37.2
+redis==5.0.1
+onnx==1.16.1
+onnxruntime==1.18.0

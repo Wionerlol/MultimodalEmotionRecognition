@@ -189,11 +189,14 @@ def train_one_epoch(
     device: torch.device,
     loss_fn: nn.Module,
     fusion_mode: str,
+    fusion_align_weight: float = 0.0,
 ) -> Dict[str, float]:
     model.train()
     all_preds = []
     all_targets = []
     total_loss = 0.0
+    total_cls_loss = 0.0
+    total_contrastive_loss = 0.0
     for video, audio, labels, _ in tqdm(loader, desc="train", leave=False):
         video = video.to(device)
         audio = audio.to(device)
@@ -208,16 +211,25 @@ def train_one_epoch(
             outputs = model(video, audio)
         if fusion_mode == "late":
             log_probs = torch.log(outputs + 1e-8)
-            loss = loss_fn(log_probs, labels)
+            cls_loss = loss_fn(log_probs, labels)
+            contrastive_loss_value = cls_loss.new_zeros(())
             preds = outputs.argmax(dim=1)
         else:
-            loss = loss_fn(outputs, labels)
+            cls_loss = loss_fn(outputs, labels)
+            contrastive_loss_value = cls_loss.new_zeros(())
             preds = outputs.argmax(dim=1)
+            if fusion_align_weight > 0.0 and hasattr(model, "pop_alignment_loss"):
+                align_loss = model.pop_alignment_loss()
+                if align_loss is not None:
+                    contrastive_loss_value = align_loss
+        loss = cls_loss + fusion_align_weight * contrastive_loss_value
 
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item() * labels.size(0)
+        total_cls_loss += cls_loss.item() * labels.size(0)
+        total_contrastive_loss += contrastive_loss_value.item() * labels.size(0)
         all_preds.append(preds)
         all_targets.append(labels)
 
@@ -225,6 +237,8 @@ def train_one_epoch(
     all_targets = torch.cat(all_targets)
     return {
         "loss": total_loss / len(loader.dataset),
+        "cls_loss": total_cls_loss / len(loader.dataset),
+        "contrastive_loss": total_contrastive_loss / len(loader.dataset),
         "acc": accuracy(all_preds, all_targets),
         "f1": macro_f1(all_preds, all_targets),
     }
@@ -237,11 +251,14 @@ def evaluate(
     device: torch.device,
     loss_fn: nn.Module,
     fusion_mode: str,
+    fusion_align_weight: float = 0.0,
 ) -> Dict[str, float]:
     model.eval()
     all_preds = []
     all_targets = []
     total_loss = 0.0
+    total_cls_loss = 0.0
+    total_contrastive_loss = 0.0
     for video, audio, labels, _ in tqdm(loader, desc="eval", leave=False):
         video = video.to(device)
         audio = audio.to(device)
@@ -254,13 +271,22 @@ def evaluate(
             outputs = model(video, audio)
         if fusion_mode == "late":
             log_probs = torch.log(outputs + 1e-8)
-            loss = loss_fn(log_probs, labels)
+            cls_loss = loss_fn(log_probs, labels)
+            contrastive_loss_value = cls_loss.new_zeros(())
             preds = outputs.argmax(dim=1)
         else:
-            loss = loss_fn(outputs, labels)
+            cls_loss = loss_fn(outputs, labels)
+            contrastive_loss_value = cls_loss.new_zeros(())
             preds = outputs.argmax(dim=1)
+            if fusion_align_weight > 0.0 and hasattr(model, "pop_alignment_loss"):
+                align_loss = model.pop_alignment_loss()
+                if align_loss is not None:
+                    contrastive_loss_value = align_loss
+        loss = cls_loss + fusion_align_weight * contrastive_loss_value
 
         total_loss += loss.item() * labels.size(0)
+        total_cls_loss += cls_loss.item() * labels.size(0)
+        total_contrastive_loss += contrastive_loss_value.item() * labels.size(0)
         all_preds.append(preds)
         all_targets.append(labels)
 
@@ -268,6 +294,8 @@ def evaluate(
     all_targets = torch.cat(all_targets)
     return {
         "loss": total_loss / len(loader.dataset),
+        "cls_loss": total_cls_loss / len(loader.dataset),
+        "contrastive_loss": total_contrastive_loss / len(loader.dataset),
         "acc": accuracy(all_preds, all_targets),
         "f1": macro_f1(all_preds, all_targets),
     }
@@ -307,30 +335,116 @@ def build_model(
     xattn_heads: int = 4,
     xattn_attn_dropout: float = 0.1,
     xattn_stochastic_depth: float = 0.1,
+    temporal_pooling: str = "mean",
+    temporal_num_heads: int = 4,
+    temporal_num_layers: int = 1,
+    temporal_dropout: float = 0.1,
     audio_n_mels: int = 64,
     use_resnet_audio: bool = True,
     use_wavlm: bool = False,
+    fusion_align_mode: str = "none",
+    fusion_align_dim: int = 256,
+    fusion_align_temperature: float = 0.07,
+    xattn_use_emotion_prior: bool = False,
+    xattn_emotion_prior_dim: int = 8,
+    xattn_emotion_prior_hidden_dim: int = 64,
+    xattn_emotion_prior_dropout: float = 0.1,
 ) -> nn.Module:
     if fusion == "audio":
         if use_wavlm:
-            return WavLMAudioEncoder(num_classes=num_classes)
+            return WavLMAudioEncoder(
+                num_classes=num_classes,
+                temporal_pooling=temporal_pooling,
+                temporal_num_heads=temporal_num_heads,
+                temporal_num_layers=temporal_num_layers,
+                temporal_dropout=temporal_dropout,
+            )
         else:
-            return AudioNet(num_classes=num_classes, use_resnet=use_resnet_audio, spec_augment=True)
+            return AudioNet(
+                num_classes=num_classes,
+                use_resnet=use_resnet_audio,
+                spec_augment=True,
+                temporal_pooling=temporal_pooling,
+                temporal_num_heads=temporal_num_heads,
+                temporal_num_layers=temporal_num_layers,
+                temporal_dropout=temporal_dropout,
+            )
     if fusion == "video":
-        return VideoNet(num_classes=num_classes, pretrained=pretrained_video)
+        return VideoNet(
+            num_classes=num_classes,
+            pretrained=pretrained_video,
+            temporal_pooling=temporal_pooling,
+            temporal_num_heads=temporal_num_heads,
+            temporal_num_layers=temporal_num_layers,
+            temporal_dropout=temporal_dropout,
+            xattn_use_emotion_prior=xattn_use_emotion_prior,
+            xattn_emotion_prior_dim=xattn_emotion_prior_dim,
+            xattn_emotion_prior_hidden_dim=xattn_emotion_prior_hidden_dim,
+            xattn_emotion_prior_dropout=xattn_emotion_prior_dropout,
+        )
     if fusion in {"late", "concat", "gated"}:
         if use_wavlm:
-            audio = WavLMAudioEncoder(num_classes=num_classes)
+            audio = WavLMAudioEncoder(
+                num_classes=num_classes,
+                temporal_pooling=temporal_pooling,
+                temporal_num_heads=temporal_num_heads,
+                temporal_num_layers=temporal_num_layers,
+                temporal_dropout=temporal_dropout,
+            )
         else:
-            audio = AudioNet(num_classes=num_classes, use_resnet=use_resnet_audio, spec_augment=True)
-        video = VideoNet(num_classes=num_classes, pretrained=pretrained_video)
-        return FusionModel(audio, video, num_classes=num_classes, mode=fusion)
+            audio = AudioNet(
+                num_classes=num_classes,
+                use_resnet=use_resnet_audio,
+                spec_augment=True,
+                temporal_pooling=temporal_pooling,
+                temporal_num_heads=temporal_num_heads,
+                temporal_num_layers=temporal_num_layers,
+                temporal_dropout=temporal_dropout,
+            )
+        video = VideoNet(
+            num_classes=num_classes,
+            pretrained=pretrained_video,
+            temporal_pooling=temporal_pooling,
+            temporal_num_heads=temporal_num_heads,
+            temporal_num_layers=temporal_num_layers,
+            temporal_dropout=temporal_dropout,
+        )
+        return FusionModel(
+            audio,
+            video,
+            num_classes=num_classes,
+            mode=fusion,
+            fusion_align_mode=fusion_align_mode,
+            fusion_align_dim=fusion_align_dim,
+            fusion_align_temperature=fusion_align_temperature,
+        )
     if fusion in {"xattn", "xattn_concat", "xattn_gated"}:
         if use_wavlm:
-            audio = WavLMAudioEncoder(num_classes=num_classes)
+            audio = WavLMAudioEncoder(
+                num_classes=num_classes,
+                temporal_pooling=temporal_pooling,
+                temporal_num_heads=temporal_num_heads,
+                temporal_num_layers=temporal_num_layers,
+                temporal_dropout=temporal_dropout,
+            )
         else:
-            audio = AudioNet(num_classes=num_classes, use_resnet=use_resnet_audio, spec_augment=True)
-        video = VideoNet(num_classes=num_classes, pretrained=pretrained_video)
+            audio = AudioNet(
+                num_classes=num_classes,
+                use_resnet=use_resnet_audio,
+                spec_augment=True,
+                temporal_pooling=temporal_pooling,
+                temporal_num_heads=temporal_num_heads,
+                temporal_num_layers=temporal_num_layers,
+                temporal_dropout=temporal_dropout,
+            )
+        video = VideoNet(
+            num_classes=num_classes,
+            pretrained=pretrained_video,
+            temporal_pooling=temporal_pooling,
+            temporal_num_heads=temporal_num_heads,
+            temporal_num_layers=temporal_num_layers,
+            temporal_dropout=temporal_dropout,
+        )
         # map alias fusion names
         head = xattn_head
         if fusion == "xattn_concat":
@@ -348,6 +462,10 @@ def build_model(
             audio_n_mels=audio_n_mels if not use_wavlm else 768,  # WavLM has 768 hidden dim
             xattn_attn_dropout=xattn_attn_dropout,
             xattn_stochastic_depth=xattn_stochastic_depth,
+            temporal_pooling=temporal_pooling,
+            temporal_num_heads=temporal_num_heads,
+            temporal_num_layers=temporal_num_layers,
+            temporal_dropout=temporal_dropout,
         )
     raise ValueError(f"Unknown fusion mode: {fusion}")
 
@@ -403,12 +521,85 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Drop-path probability on xattn residual branches (default 0.1)",
     )
     parser.add_argument(
+        "--xattn_use_emotion_prior",
+        action="store_true",
+        help="Enable emotion-prior-conditioned attention bias in xattn.",
+    )
+    parser.add_argument(
+        "--xattn_emotion_prior_dim",
+        type=int,
+        default=8,
+        help="Dimension of the global emotion prior vector used to bias xattn.",
+    )
+    parser.add_argument(
+        "--xattn_emotion_prior_hidden_dim",
+        type=int,
+        default=64,
+        help="Hidden size of the emotion prior MLP.",
+    )
+    parser.add_argument(
+        "--xattn_emotion_prior_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout inside the emotion prior module.",
+    )
+    parser.add_argument(
+        "--temporal_pooling",
+        type=str,
+        default="mean",
+        choices=["mean", "attn", "transformer"],
+        help="Temporal aggregation for sequence features: mean, learnable attention, or transformer.",
+    )
+    parser.add_argument(
+        "--temporal_num_heads",
+        type=int,
+        default=4,
+        help="Attention heads used by temporal transformer pooling (default 4).",
+    )
+    parser.add_argument(
+        "--temporal_num_layers",
+        type=int,
+        default=1,
+        help="Transformer layers used by temporal transformer pooling (default 1).",
+    )
+    parser.add_argument(
+        "--temporal_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout used inside temporal attention/transformer pooling (default 0.1).",
+    )
+    parser.add_argument(
         "--label_smoothing",
         type=float,
         default=0.0,
         help="Label smoothing for CrossEntropyLoss in non-late modes (default 0.0)",
     )
     parser.add_argument("--audio_n_mels", type=int, default=64, help="n_mels used in audio preprocessing (default 64)")
+    parser.add_argument(
+        "--fusion_align_mode",
+        type=str,
+        default="none",
+        choices=["none", "clip"],
+        help="Optional semantic alignment before concat/gated fusion. 'clip' enables CLIP-style shared-space alignment.",
+    )
+    parser.add_argument(
+        "--fusion_align_dim",
+        type=int,
+        default=256,
+        help="Shared embedding dimension used by semantic alignment before concat/gated fusion.",
+    )
+    parser.add_argument(
+        "--fusion_align_temperature",
+        type=float,
+        default=0.07,
+        help="Initial temperature for CLIP-style alignment logits.",
+    )
+    parser.add_argument(
+        "--fusion_align_weight",
+        type=float,
+        default=0.1,
+        help="Weight for the auxiliary CLIP-style alignment loss when semantic alignment is enabled.",
+    )
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="L2 regularization weight decay (default: 1e-4)")
     parser.add_argument("--early_stopping_patience", type=int, default=10, help="Early stopping patience in epochs (set 0 to disable)")
     parser.add_argument("--use_resnet_audio", action="store_true", help="Use ResNet18 for audio encoder (default: lightweight CNN)")
@@ -502,6 +693,31 @@ class EmotionTrainer:
                     "cosine_annealing": self.args.use_cosine_annealing,
                 },
             )
+
+    def _checkpoint_config(self) -> Dict[str, object]:
+        return {
+            "fusion": self.args.fusion,
+            "use_wavlm": bool(self.args.use_wavlm),
+            "xattn_head": getattr(self.args, "xattn_head", "concat"),
+            "xattn_d_model": getattr(self.args, "xattn_d_model", 128),
+            "xattn_heads": getattr(self.args, "xattn_heads", 4),
+            "xattn_attn_dropout": getattr(self.args, "xattn_attn_dropout", 0.1),
+            "xattn_stochastic_depth": getattr(self.args, "xattn_stochastic_depth", 0.1),
+            "xattn_use_emotion_prior": getattr(self.args, "xattn_use_emotion_prior", False),
+            "xattn_emotion_prior_dim": getattr(self.args, "xattn_emotion_prior_dim", 8),
+            "xattn_emotion_prior_hidden_dim": getattr(self.args, "xattn_emotion_prior_hidden_dim", 64),
+            "xattn_emotion_prior_dropout": getattr(self.args, "xattn_emotion_prior_dropout", 0.1),
+            "temporal_pooling": getattr(self.args, "temporal_pooling", "mean"),
+            "temporal_num_heads": getattr(self.args, "temporal_num_heads", 4),
+            "temporal_num_layers": getattr(self.args, "temporal_num_layers", 1),
+            "temporal_dropout": getattr(self.args, "temporal_dropout", 0.1),
+            "audio_n_mels": getattr(self.args, "audio_n_mels", 64),
+            "use_resnet_audio": getattr(self.args, "use_resnet_audio", True),
+            "fusion_align_mode": getattr(self.args, "fusion_align_mode", "none"),
+            "fusion_align_dim": getattr(self.args, "fusion_align_dim", 256),
+            "fusion_align_temperature": getattr(self.args, "fusion_align_temperature", 0.07),
+            "fusion_align_weight": getattr(self.args, "fusion_align_weight", 0.1),
+        }
 
     @staticmethod
     def _set_module_trainable(module: nn.Module, trainable: bool) -> None:
@@ -774,6 +990,12 @@ class EmotionTrainer:
         print(f"Device: {device}")
         print(f"{'=' * 60}\n")
 
+        if args.fusion_align_mode != "none" and args.fusion not in {"concat", "gated"}:
+            print(
+                f"[INFO] fusion_align_mode={args.fusion_align_mode} is only applied to concat/gated fusion; "
+                f"current fusion={args.fusion} will ignore it."
+            )
+
         model = build_model(
             args.num_classes,
             args.fusion,
@@ -783,9 +1005,20 @@ class EmotionTrainer:
             xattn_heads=getattr(args, "xattn_heads", 4),
             xattn_attn_dropout=getattr(args, "xattn_attn_dropout", 0.1),
             xattn_stochastic_depth=getattr(args, "xattn_stochastic_depth", 0.1),
+            xattn_use_emotion_prior=getattr(args, "xattn_use_emotion_prior", False),
+            xattn_emotion_prior_dim=getattr(args, "xattn_emotion_prior_dim", 8),
+            xattn_emotion_prior_hidden_dim=getattr(args, "xattn_emotion_prior_hidden_dim", 64),
+            xattn_emotion_prior_dropout=getattr(args, "xattn_emotion_prior_dropout", 0.1),
+            temporal_pooling=getattr(args, "temporal_pooling", "mean"),
+            temporal_num_heads=getattr(args, "temporal_num_heads", 4),
+            temporal_num_layers=getattr(args, "temporal_num_layers", 1),
+            temporal_dropout=getattr(args, "temporal_dropout", 0.1),
             audio_n_mels=getattr(args, "audio_n_mels", 64),
             use_resnet_audio=getattr(args, "use_resnet_audio", True),
             use_wavlm=args.use_wavlm,
+            fusion_align_mode=getattr(args, "fusion_align_mode", "none"),
+            fusion_align_dim=getattr(args, "fusion_align_dim", 256),
+            fusion_align_temperature=getattr(args, "fusion_align_temperature", 0.07),
         )
         self._load_fusion_branch_checkpoints(model)
         model.to(device)
@@ -848,8 +1081,23 @@ class EmotionTrainer:
                 scheduler = self._build_scheduler(optimizer, epochs_in_stage=args.epochs - stage1_epochs)
                 print(f"[INFO] Switched to stage-2 at epoch {epoch}.")
 
-            train_metrics = train_one_epoch(model, train_loader, optimizer, device, loss_fn, args.fusion)
-            val_metrics = evaluate(model, val_loader, device, loss_fn, args.fusion)
+            train_metrics = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                loss_fn,
+                args.fusion,
+                fusion_align_weight=getattr(args, "fusion_align_weight", 0.0),
+            )
+            val_metrics = evaluate(
+                model,
+                val_loader,
+                device,
+                loss_fn,
+                args.fusion,
+                fusion_align_weight=getattr(args, "fusion_align_weight", 0.0),
+            )
 
             if scheduler is not None:
                 scheduler.step()
@@ -859,8 +1107,12 @@ class EmotionTrainer:
             print(
                 f"Epoch {epoch:02d} | "
                 f"stage {stage_text} | "
-                f"train loss {train_metrics['loss']:.4f} acc {train_metrics['acc']:.4f} f1 {train_metrics['f1']:.4f} | "
-                f"val loss {val_metrics['loss']:.4f} acc {val_metrics['acc']:.4f} f1 {val_metrics['f1']:.4f} | "
+                f"train loss {train_metrics['loss']:.4f} "
+                f"(cls {train_metrics['cls_loss']:.4f}, ctr {train_metrics['contrastive_loss']:.4f}) "
+                f"acc {train_metrics['acc']:.4f} f1 {train_metrics['f1']:.4f} | "
+                f"val loss {val_metrics['loss']:.4f} "
+                f"(cls {val_metrics['cls_loss']:.4f}, ctr {val_metrics['contrastive_loss']:.4f}) "
+                f"acc {val_metrics['acc']:.4f} f1 {val_metrics['f1']:.4f} | "
                 f"lr {current_lr_text}"
             )
 
@@ -869,9 +1121,13 @@ class EmotionTrainer:
                     {
                         "epoch": epoch,
                         "train/loss": train_metrics["loss"],
+                        "train/cls_loss": train_metrics["cls_loss"],
+                        "train/contrastive_loss": train_metrics["contrastive_loss"],
                         "train/acc": train_metrics["acc"],
                         "train/f1": train_metrics["f1"],
                         "val/loss": val_metrics["loss"],
+                        "val/cls_loss": val_metrics["cls_loss"],
+                        "val/contrastive_loss": val_metrics["contrastive_loss"],
                         "val/acc": val_metrics["acc"],
                         "val/f1": val_metrics["f1"],
                         "lr": optimizer.param_groups[0]["lr"],
@@ -882,7 +1138,10 @@ class EmotionTrainer:
             if val_metrics["f1"] > best_f1:
                 best_f1 = val_metrics["f1"]
                 early_stopping_counter = 0
-                torch.save({"model": model.state_dict(), "val_f1": best_f1}, best_path)
+                torch.save(
+                    {"model": model.state_dict(), "val_f1": best_f1, "config": self._checkpoint_config()},
+                    best_path,
+                )
             else:
                 early_stopping_counter += 1
                 if args.early_stopping_patience > 0 and early_stopping_counter >= args.early_stopping_patience:
@@ -891,8 +1150,19 @@ class EmotionTrainer:
                     break
 
         if sizes["test"] > 0:
-            test_metrics = evaluate(model, test_loader, device, loss_fn, args.fusion)
-            print(f"Test | loss {test_metrics['loss']:.4f} acc {test_metrics['acc']:.4f} f1 {test_metrics['f1']:.4f}")
+            test_metrics = evaluate(
+                model,
+                test_loader,
+                device,
+                loss_fn,
+                args.fusion,
+                fusion_align_weight=getattr(args, "fusion_align_weight", 0.0),
+            )
+            print(
+                f"Test | loss {test_metrics['loss']:.4f} "
+                f"(cls {test_metrics['cls_loss']:.4f}, ctr {test_metrics['contrastive_loss']:.4f}) "
+                f"acc {test_metrics['acc']:.4f} f1 {test_metrics['f1']:.4f}"
+            )
 
             if args.wandb:
                 test_preds = []
@@ -916,7 +1186,15 @@ class EmotionTrainer:
                 cm_fig = plot_confusion_matrix(test_preds, test_targets, args.num_classes)
                 wandb.log({"test/confusion_matrix": wandb.Image(cm_fig)})
                 plt.close(cm_fig)
-                wandb.log({"test/loss": test_metrics["loss"], "test/acc": test_metrics["acc"], "test/f1": test_metrics["f1"]})
+                wandb.log(
+                    {
+                        "test/loss": test_metrics["loss"],
+                        "test/cls_loss": test_metrics["cls_loss"],
+                        "test/contrastive_loss": test_metrics["contrastive_loss"],
+                        "test/acc": test_metrics["acc"],
+                        "test/f1": test_metrics["f1"],
+                    }
+                )
 
         print(f"Best val macro-F1: {best_f1:.4f} | checkpoint: {best_path}")
         if args.wandb:

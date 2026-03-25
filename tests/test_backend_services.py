@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from backend.app.model_loader import DummyModel, ModelLoaderService, _InferenceModelAdapter
 from backend.app.preprocess import EmotionPreprocessService
+from backend.app.streaming import StreamingEmotionSession
 
 
 class _FakeModel(nn.Module):
@@ -30,6 +31,19 @@ class _FakeModel(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = False):
         self.loaded_state_dict = state_dict
         return [], []
+
+
+class _FakePredictor:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def predict_stream(self, frames, waveform, waveform_sample_rate: int, use_face_crop: bool = True):
+        self.calls.append((len(frames), waveform.shape[0], waveform_sample_rate, use_face_crop))
+        return {
+            "labels": ["neutral"],
+            "probs": [100.0],
+            "top1": {"label": "neutral", "prob": 100.0},
+        }
 
 
 class TestEmotionPreprocessService(unittest.TestCase):
@@ -125,7 +139,43 @@ class TestModelLoaderService(unittest.TestCase):
                 fusion_mode="xattn",
                 xattn_head="concat",
                 use_wavlm=True,
+                config={},
             )
+
+
+class TestStreamingEmotionSession(unittest.TestCase):
+    def test_session_requires_enough_audio_and_frames(self) -> None:
+        predictor = _FakePredictor()
+        session = StreamingEmotionSession(predictor=predictor, window_seconds=3.0, step_seconds=0.5)
+
+        frame = np.zeros((16, 16, 3), dtype=np.uint8)
+        session.add_frame(frame, timestamp=1.0)
+        session.add_frame(frame, timestamp=2.0)
+        self.assertFalse(session.ready_for_inference(now=2.0))
+
+        audio = np.zeros(48000, dtype=np.float32)
+        session.add_audio_chunk(audio, sample_rate=16000, timestamp=2.0)
+        self.assertTrue(session.ready_for_inference(now=2.0))
+
+    def test_session_builds_sliding_window_and_updates_cadence(self) -> None:
+        predictor = _FakePredictor()
+        session = StreamingEmotionSession(
+            predictor=predictor,
+            window_seconds=3.0,
+            step_seconds=0.5,
+            max_buffer_seconds=6.0,
+        )
+        frame = np.zeros((16, 16, 3), dtype=np.uint8)
+        for ts in (1.0, 2.0, 3.5, 4.0):
+            session.add_frame(frame, timestamp=ts)
+        session.add_audio_chunk(np.zeros(32000, dtype=np.float32), sample_rate=16000, timestamp=2.0)
+        session.add_audio_chunk(np.zeros(32000, dtype=np.float32), sample_rate=16000, timestamp=4.0)
+
+        result = session.infer(now=4.0)
+        self.assertEqual(result["top1"]["label"], "neutral")
+        self.assertEqual(result["num_buffered_frames"], 2)
+        self.assertFalse(session.ready_for_inference(now=4.2))
+        self.assertTrue(session.ready_for_inference(now=4.6))
 
 
 if __name__ == "__main__":

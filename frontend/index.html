@@ -12,13 +12,14 @@
         
         <div class="main-panel">
             <div class="left-panel">
-                <h2>Record Video</h2>
+                <h2>Live Streaming</h2>
                 <video id="preview" autoplay muted></video>
                 <div class="controls">
-                    <button id="startBtn" class="btn btn-primary">Start Recording</button>
-                    <button id="stopBtn" class="btn btn-secondary" disabled>Stop Recording</button>
-                    <button id="uploadBtn" class="btn btn-success" disabled>Predict Emotion</button>
+                    <button id="startBtn" class="btn btn-primary">Start Streaming</button>
+                    <button id="stopBtn" class="btn btn-secondary" disabled>Stop Streaming</button>
+                    <button id="uploadBtn" class="btn btn-success">One-shot Predict</button>
                 </div>
+                <p class="mode-note">Streaming mode sends frame and audio chunks over WebSocket and runs sliding-window inference on the backend.</p>
                 <p class="timer" id="timer"></p>
                 <p class="status" id="status">Ready</p>
             </div>
@@ -26,7 +27,7 @@
             <div class="right-panel">
                 <h2>Results</h2>
                 <div id="results" class="results-container">
-                    <p class="placeholder">No results yet. Record and upload a video.</p>
+                    <p class="placeholder">No results yet. Start streaming or run a one-shot prediction.</p>
                 </div>
             </div>
         </div>

@@ -18,6 +18,8 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from src.models.fusion import FusionModel
+from src.models.audio import AudioNet
+from src.models.temporal import TemporalPooler
 from src.train import build_dataloaders
 
 
@@ -67,6 +69,14 @@ class _ToyDataset(Dataset):
 
 
 class TestAttentionIntegration(unittest.TestCase):
+    def test_temporal_pooler_modes_preserve_batch_and_channel_dims(self) -> None:
+        x = torch.randn(2, 5, 8)
+        for mode in ("mean", "attn", "transformer"):
+            with self.subTest(mode=mode):
+                pooler = TemporalPooler(dim=8, mode=mode, num_heads=2, num_layers=1, dropout=0.0)
+                pooled = pooler(x)
+                self.assertEqual(tuple(pooled.shape), (2, 8))
+
     def test_xattn_uses_audio_encode_sequence(self) -> None:
         audio_model = _DummyAudioModel(sequence_dim=8)
         video_model = _DummyVideoModel(embedding_dim=16)
@@ -88,6 +98,50 @@ class TestAttentionIntegration(unittest.TestCase):
 
         self.assertTrue(audio_model.called, "xAttn should consume audio_model.encode_sequence()")
         self.assertEqual(tuple(logits.shape), (2, 8))
+
+    def test_xattn_supports_temporal_transformer_pooling(self) -> None:
+        audio_model = _DummyAudioModel(sequence_dim=8)
+        video_model = _DummyVideoModel(embedding_dim=16)
+        model = FusionModel(
+            audio_model=audio_model,
+            video_model=video_model,
+            num_classes=8,
+            mode="xattn",
+            d_model=8,
+            num_heads=2,
+            audio_n_mels=64,
+            temporal_pooling="transformer",
+            temporal_num_heads=2,
+            temporal_num_layers=1,
+            temporal_dropout=0.0,
+        )
+        model.eval()
+
+        video = torch.randn(2, 4, 3, 16, 16)
+        audio = torch.randn(2, 1, 12)
+        with torch.no_grad():
+            logits = model(video, audio)
+
+        self.assertEqual(tuple(logits.shape), (2, 8))
+
+    def test_mel_audio_net_exposes_temporal_sequence(self) -> None:
+        model = AudioNet(
+            num_classes=8,
+            use_resnet=False,
+            spec_augment=False,
+            temporal_pooling="attn",
+            temporal_num_heads=2,
+            temporal_num_layers=1,
+            temporal_dropout=0.0,
+        )
+        mel = torch.randn(2, 1, 64, 301)
+        with torch.no_grad():
+            seq = model.encode_sequence(mel)
+            emb = model.encode(mel)
+
+        self.assertGreater(seq.shape[1], 1)
+        self.assertEqual(tuple(seq.shape[:1] + seq.shape[2:]), (2, 128))
+        self.assertEqual(tuple(emb.shape), (2, 128))
 
     def test_build_dataloaders_passes_stratified_ratios(self) -> None:
         fake_pairs = [

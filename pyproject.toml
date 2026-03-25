@@ -21,6 +21,12 @@ dependencies = [
     "opencv-python-headless>=4.13.0.92",
 ]
 
+[project.optional-dependencies]
+inference-opt = [
+    "onnx==1.16.1",
+    "onnxruntime==1.18.0",
+]
+
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"

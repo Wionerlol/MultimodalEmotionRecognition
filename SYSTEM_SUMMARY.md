@@ -12,18 +12,24 @@ A full-stack application for audio-visual emotion recognition with:
 
 ### 1. **Training Pipeline** (`src/`)
 - Cross-attention fusion model (xAttn)
+- Concat / gated / xattn 多种融合方式
+- Temporal modeling ablations (`mean / attn / transformer`)
+- Optional CLIP-style semantic alignment before concat/gated fusion
+- Optional emotion-prior-conditioned attention bias for xAttn
 - RAVDESS dataset support
 - Stratified train/val/test splits
 - Weights & Biases monitoring
 - L2 regularization + early stopping
 - Cosine annealing scheduler
 
-### 2. **Inference Backend** (`backend/`)
+### 2. **Inference Backend** (`backend/` / `src/`)
 - FastAPI REST API on port 8000
+- Redis queue gateway + independent inference worker
 - `/health` - Service status
-- `/predict` - Emotion classification from video
-- Mock mode for testing without checkpoint
+- `/predict` - Synchronous queued prediction
+- `/submit` + `/result/{task_id}` - Asynchronous task workflow
 - Automatic video/audio preprocessing
+- Optional ONNX / INT8 / dynamic quantized inference path
 - Graceful error handling
 
 ### 3. **Web Frontend** (`frontend/`)
@@ -116,8 +122,9 @@ docker compose up --build
 |-----------|-----------|---------|
 | **Video Input** | MediaRecorder API | Browser webcam capture |
 | **Video Processing** | OpenCV + librosa | Frame extraction, mel-spectrogram |
-| **Model Framework** | PyTorch 2.1 | Cross-attention fusion |
+| **Model Framework** | PyTorch 2.1 | Cross-attention + multimodal fusion |
 | **Inference Server** | FastAPI + uvicorn | REST API |
+| **Queue Layer** | Redis | Distributed inference queue |
 | **Frontend Server** | nginx | Static HTML/CSS/JS hosting |
 | **Containerization** | Docker + Docker Compose | Multi-service orchestration |
 | **Optional LLM** | vLLM | OpenAI-compatible API |
@@ -129,6 +136,20 @@ docker compose up --build
 ### Input
 - **Video**: 8 frames @ 112×112 pixels (3-second clip)
 - **Audio**: 3-second clip @ 16kHz, converted to 64-bin mel-spectrogram
+- **Optional audio path**: raw waveform for WavLM
+
+### Current Architecture Notes
+
+- Video/audio branches both support configurable temporal aggregation:
+  - `mean`
+  - `attention pooling`
+  - `temporal transformer`
+- `concat` / `gated` fusion can optionally insert a CLIP-style shared embedding alignment module before fusion
+- `xattn` can optionally inject an emotion-prior-conditioned token-wise attention bias
+- Training logs now separate:
+  - total loss
+  - classification loss
+  - contrastive loss
 
 ### Tensor Dimension Flow Diagram
 
@@ -717,6 +738,14 @@ docker compose up --build
 - **Health Check**: < 100ms
 - **Inference (3s video)**: 2-5 seconds (CPU), < 1s (GPU)
 - **Frontend Load**: < 1 second
+
+### Inference Optimization Paths
+- Redis-backed queue + batch worker for parallel request processing
+- PyTorch default inference
+- PyTorch CPU dynamic quantization (`Linear` layers)
+- ONNX export for deployment portability
+- ONNX Runtime backend
+- INT8 ONNX model export for lower-latency / lower-memory CPU serving
 
 ### Accuracy (Typical)
 - **Train**: 85-90% accuracy

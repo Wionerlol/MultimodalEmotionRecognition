@@ -4,6 +4,8 @@ import torch
 from torch import nn
 import torchaudio.transforms as T
 
+from .temporal import TemporalPooler
+
 
 class SpecAugment(nn.Module):
     """SpecAugment: Augmenting the time and frequency dimensions of spectrograms."""
@@ -52,9 +54,10 @@ class SpecAugment(nn.Module):
 
 class AudioResNet18(nn.Module):
     """ResNet18 adapted for mel-spectrogram input (single channel)."""
-    def __init__(self, embedding_dim: int = 128) -> None:
+    def __init__(self, embedding_dim: int = 128, temporal_bins: int = 16) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.temporal_bins = temporal_bins
         
         # Use ResNet18 architecture but adapted for 1-channel input
         # Initial conv: 1 channel -> 64 channels
@@ -69,7 +72,7 @@ class AudioResNet18(nn.Module):
         self.layer3 = self._make_layer(128, 256, 2, stride=2)
         self.layer4 = self._make_layer(256, 512, 2, stride=2)
         
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.sequence_pool = nn.AdaptiveAvgPool2d((1, temporal_bins))
         self.fc = nn.Linear(512, embedding_dim)
     
     def _make_layer(self, in_channels: int, out_channels: int, blocks: int, stride: int = 1) -> nn.Sequential:
@@ -96,7 +99,7 @@ class AudioResNet18(nn.Module):
             nn.BatchNorm2d(out_channels),
         )
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_sequence(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -106,17 +109,21 @@ class AudioResNet18(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+
+        x = self.sequence_pool(x).squeeze(2).transpose(1, 2).contiguous()
         x = self.fc(x)
         return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq = self.forward_sequence(x)
+        return seq.mean(dim=1)
 
 
 class AudioCNN(nn.Module):
     """Original lightweight CNN for mel-spectrogram."""
-    def __init__(self, embedding_dim: int = 128) -> None:
+    def __init__(self, embedding_dim: int = 128, temporal_bins: int = 16) -> None:
         super().__init__()
+        self.temporal_bins = temporal_bins
         self.features = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
@@ -129,23 +136,36 @@ class AudioCNN(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((4, 4)),
         )
         self.proj = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 4 * 4, embedding_dim),
+            nn.Linear(64, embedding_dim),
             nn.ReLU(inplace=True),
         )
+        self.sequence_pool = nn.AdaptiveAvgPool2d((1, temporal_bins))
         self.embedding_dim = embedding_dim
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_sequence(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
+        x = self.sequence_pool(x).squeeze(2).transpose(1, 2).contiguous()
         return self.proj(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq = self.forward_sequence(x)
+        return seq.mean(dim=1)
 
 
 class AudioNet(nn.Module):
-    def __init__(self, num_classes: int, embedding_dim: int = 128, use_resnet: bool = True, 
-                 spec_augment: bool = True) -> None:
+    def __init__(
+        self,
+        num_classes: int,
+        embedding_dim: int = 128,
+        use_resnet: bool = True,
+        spec_augment: bool = True,
+        temporal_pooling: str = "mean",
+        temporal_num_heads: int = 4,
+        temporal_num_layers: int = 1,
+        temporal_dropout: float = 0.1,
+    ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
         self.sequence_dim = embedding_dim
@@ -155,6 +175,13 @@ class AudioNet(nn.Module):
             self.encoder = AudioResNet18(embedding_dim=embedding_dim)
         else:
             self.encoder = AudioCNN(embedding_dim=embedding_dim)
+        self.temporal_pool = TemporalPooler(
+            dim=embedding_dim,
+            mode=temporal_pooling,
+            num_heads=temporal_num_heads,
+            num_layers=temporal_num_layers,
+            dropout=temporal_dropout,
+        )
         
         # SpecAugment for training
         self.spec_augment = SpecAugment(freq_mask_param=20, time_mask_param=40, p=0.5) if spec_augment else None
@@ -165,17 +192,15 @@ class AudioNet(nn.Module):
         # Apply SpecAugment during training
         if self.spec_augment is not None and self.training:
             x = self.spec_augment(x)
-        return self.encoder(x)
+        seq = self.encoder.forward_sequence(x)
+        return self.temporal_pool(seq)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         emb = self.encode(x)
         return self.classifier(emb)
 
     def encode_sequence(self, x: torch.Tensor) -> torch.Tensor:
-        """Return a compact sequence view for fusion models.
-
-        AudioNet is clip-level by design, so we expose a single-step sequence
-        to let xAttn consume encoder-derived features and benefit from warm-start.
-        """
-        emb = self.encode(x)  # [B, D]
-        return emb.unsqueeze(1)  # [B, 1, D]
+        """Return encoder-derived temporal states for fusion models."""
+        if self.spec_augment is not None and self.training:
+            x = self.spec_augment(x)
+        return self.encoder.forward_sequence(x)

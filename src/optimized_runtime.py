@@ -19,6 +19,28 @@ def labels_for_num_classes(num_classes: int) -> list[str]:
     return EIGHT_CLASS_LABELS if num_classes == 8 else FOUR_CLASS_LABELS
 
 
+def infer_model_signature(state_dict: dict[str, torch.Tensor]) -> tuple[str, str]:
+    if any(k.startswith("audio_model.") for k in state_dict) and any(k.startswith("video_model.") for k in state_dict):
+        if any(k.startswith("xattn_gate.") for k in state_dict):
+            return "xattn", "gated"
+        if any(k.startswith("xattn_mlp.") for k in state_dict):
+            return "xattn", "concat"
+        if any(k.startswith("fusion.") for k in state_dict):
+            return "concat", "concat"
+        if any(k.startswith("gate.") for k in state_dict):
+            return "gated", "gated"
+        return "late", "concat"
+    if any(k.startswith("encoder.") for k in state_dict) or any(k.startswith("wavlm.") for k in state_dict):
+        return "audio", "concat"
+    if any(k.startswith("backbone.") for k in state_dict):
+        return "video", "concat"
+    raise RuntimeError("Unable to infer model type from checkpoint state_dict keys.")
+
+
+def checkpoint_uses_wavlm(state_dict: dict[str, torch.Tensor]) -> bool:
+    return any(k.startswith("audio_model.wavlm.") for k in state_dict) or any(k.startswith("wavlm.") for k in state_dict)
+
+
 class TorchModelRunner:
     def __init__(self, checkpoint_path: str, device: str, fallback_fusion: str = "xattn", enable_dynamic_quant: bool = False):
         self.device = torch.device(device)
@@ -27,17 +49,22 @@ class TorchModelRunner:
             raise RuntimeError("Checkpoint format not supported. Expected {'model': state_dict, 'config': ...}.")
 
         self.config = checkpoint.get("config", {})
-        self.fusion_mode = str(self.config.get("fusion", fallback_fusion))
+        state_dict = checkpoint["model"]
+        if "fusion" in self.config:
+            self.fusion_mode = str(self.config.get("fusion", fallback_fusion))
+            xattn_head = str(self.config.get("xattn_head", "concat"))
+        else:
+            self.fusion_mode, xattn_head = infer_model_signature(state_dict)
         if self.fusion_mode not in FUSION_MODES:
             raise ValueError(f"Unsupported fusion mode: {self.fusion_mode}")
 
         self.num_classes = int(self.config.get("num_classes", 8))
-        self.use_wavlm = bool(self.config.get("use_wavlm", False))
+        self.use_wavlm = bool(self.config.get("use_wavlm", checkpoint_uses_wavlm(state_dict)))
         self.labels = labels_for_num_classes(self.num_classes)
         model = build_model(
             num_classes=self.num_classes,
             fusion=self.fusion_mode,
-            xattn_head=self.config.get("xattn_head", "concat"),
+            xattn_head=xattn_head,
             xattn_d_model=self.config.get("xattn_d_model", 128),
             xattn_heads=self.config.get("xattn_heads", 4),
             xattn_attn_dropout=self.config.get("xattn_attn_dropout", 0.1),
@@ -57,7 +84,14 @@ class TorchModelRunner:
             fusion_align_dim=self.config.get("fusion_align_dim", 256),
             fusion_align_temperature=self.config.get("fusion_align_temperature", 0.07),
         )
-        model.load_state_dict(checkpoint["model"])
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            raise RuntimeError(f"Unexpected checkpoint keys ({len(unexpected)}): {unexpected[:8]}")
+        if len(missing) > 32:
+            raise RuntimeError(
+                f"Too many missing keys when loading checkpoint ({len(missing)}). "
+                "Checkpoint architecture does not match the inferred runtime model."
+            )
         if enable_dynamic_quant and self.device.type == "cpu":
             model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
         self.model = model.to(self.device).eval()

@@ -520,3 +520,19 @@ def preprocess_video_audio(
         use_face_crop=use_face_crop,
         use_wavlm=use_wavlm,
     )
+
+
+def preprocess_stream_window(
+    frames: Sequence[np.ndarray],
+    waveform: np.ndarray,
+    waveform_sample_rate: int,
+    use_face_crop: bool = True,
+    use_wavlm: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return PREPROCESS_SERVICE.preprocess_stream_window(
+        frames=frames,
+        waveform=waveform,
+        waveform_sample_rate=waveform_sample_rate,
+        use_face_crop=use_face_crop,
+        use_wavlm=use_wavlm,
+    )

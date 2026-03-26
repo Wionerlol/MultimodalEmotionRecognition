@@ -17,8 +17,8 @@ function resolveBackendUrl() {
         typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("backend") : "";
     const fallback =
         typeof window !== "undefined"
-            ? `${window.location.protocol}//${window.location.hostname}:8000`
-            : "http://localhost:8000";
+            ? `${window.location.protocol}//${window.location.hostname}:8002`
+            : "http://localhost:8002";
     return (fromQuery || fromWindow || fallback).replace(/\/$/, "");
 }
 

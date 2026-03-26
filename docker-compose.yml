@@ -1,11 +1,27 @@
 version: "3.8"
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: emotion_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   # Backend API Server
   backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        APT_MIRROR: mirrors.tuna.tsinghua.edu.cn
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+        PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
     container_name: emotion_backend
     ports:
       - "8000:8000"
@@ -15,6 +31,7 @@ services:
       - EMO_MOCK=0
       - MODEL_SRC_DIR=/app/src
       - HF_LOCAL_ONLY=1
+      - HF_ENDPOINT=https://hf-mirror.com
       - WATCHFILES_FORCE_POLLING=1
     volumes:
       - ./checkpoints:/app/checkpoints
@@ -27,6 +44,68 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  inference_api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        APT_MIRROR: mirrors.tuna.tsinghua.edu.cn
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+        PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+    container_name: emotion_inference_api
+    ports:
+      - "8002:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HF_LOCAL_ONLY=1
+      - HF_ENDPOINT=https://hf-mirror.com
+      - EMO_REDIS_URL=redis://redis:6379/0
+      - EMO_CHECKPOINT=/app/checkpoints/best.pt
+      - EMO_BATCH_SIZE=8
+      - EMO_BATCH_TIMEOUT_MS=20
+      - EMO_WORKER_COUNT=1
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./src:/app/src
+      - ./backend/app:/app/app
+    command: uvicorn inference_server:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  inference_worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        APT_MIRROR: mirrors.tuna.tsinghua.edu.cn
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+        PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+    container_name: emotion_inference_worker
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HF_LOCAL_ONLY=1
+      - HF_ENDPOINT=https://hf-mirror.com
+      - EMO_REDIS_URL=redis://redis:6379/0
+      - EMO_CHECKPOINT=/app/checkpoints/best.pt
+      - EMO_BATCH_SIZE=8
+      - EMO_BATCH_TIMEOUT_MS=20
+      - EMO_WORKER_NAME=docker-worker-1
+      - EMO_INFERENCE_BACKEND=torch
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./src:/app/src
+    command: python -m inference_worker
+    depends_on:
+      redis:
+        condition: service_healthy
 
   # Frontend Web Server
   frontend:

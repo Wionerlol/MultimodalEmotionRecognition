@@ -3,14 +3,33 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from redis import asyncio as redis_async
+
+_THIS_FILE = Path(__file__).resolve()
+_PROJECT_ROOT = _THIS_FILE.parents[1]
+for candidate in (_PROJECT_ROOT, _PROJECT_ROOT / "src"):
+    candidate_text = str(candidate)
+    if candidate.exists() and candidate_text not in sys.path:
+        sys.path.insert(0, candidate_text)
+
+try:
+    from app.infer import EmotionPredictor
+    from app.streaming import StreamingSessionManager, decode_frame_b64, decode_pcm16_b64
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from backend.app.infer import EmotionPredictor
+    from backend.app.streaming import StreamingSessionManager, decode_frame_b64, decode_pcm16_b64
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -132,15 +151,79 @@ class RedisInferenceGateway:
         return f"emo:task:{task_id}:payload"
 
 
+class StreamingInferenceService:
+    def __init__(self) -> None:
+        mock = os.environ.get("EMO_MOCK", "0") == "1"
+        self.predictor = EmotionPredictor(mock_mode=mock)
+        self.streaming = StreamingSessionManager(self.predictor)
+
+    async def handle_stream(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        session = self.streaming.create_session(use_face_crop=True)
+        await websocket.send_json({"type": "session_started", "session_id": session.session_id})
+
+        try:
+            while True:
+                payload = await websocket.receive_json()
+                msg_type = str(payload.get("type", "")).lower()
+
+                if msg_type == "start":
+                    await websocket.send_json({"type": "ack", "session_id": session.session_id})
+                    continue
+
+                if msg_type == "frame":
+                    frame = decode_frame_b64(str(payload["image_b64"]))
+                    session.add_frame(frame, timestamp=payload.get("timestamp"))
+                    if session.ready_for_inference():
+                        result = session.infer()
+                        await websocket.send_json({"type": "prediction", "payload": result})
+                    continue
+
+                if msg_type == "audio":
+                    audio = decode_pcm16_b64(str(payload["pcm_b64"]))
+                    session.add_audio_chunk(
+                        audio,
+                        sample_rate=int(payload.get("sample_rate", 16000)),
+                        timestamp=payload.get("timestamp"),
+                    )
+                    if session.ready_for_inference():
+                        result = session.infer()
+                        await websocket.send_json({"type": "prediction", "payload": result})
+                    continue
+
+                if msg_type == "flush":
+                    if session.audio_sample_count > 0 and session.frames:
+                        result = session.infer()
+                        await websocket.send_json({"type": "prediction", "payload": result})
+                    continue
+
+                if msg_type == "stop":
+                    await websocket.send_json({"type": "session_stopped", "session_id": session.session_id})
+                    return
+
+                await websocket.send_json({"type": "error", "detail": f"Unknown message type: {msg_type}"})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            self.streaming.close_session(session.session_id)
+
+
 settings = ServerSettings()
 gateway: Optional[RedisInferenceGateway] = None
+streaming_service: Optional[StreamingInferenceService] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gateway
+    global gateway, streaming_service
     gateway = RedisInferenceGateway(settings)
     await gateway.start()
+    try:
+        streaming_service = StreamingInferenceService()
+        print("[INFO] Streaming inference service initialized.")
+    except Exception as exc:
+        streaming_service = None
+        print(f"[ERROR] Failed to initialize streaming inference service: {exc}")
     try:
         yield
     finally:
@@ -149,6 +232,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Multimodal Emotion Redis Inference", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -156,7 +246,7 @@ async def health() -> dict[str, Any]:
     if gateway is None:
         raise HTTPException(status_code=503, detail="Redis gateway not ready.")
     stats = await gateway.queue_stats()
-    return {"status": "ok", **stats}
+    return {"status": "ok", "streaming_ready": streaming_service is not None, **stats}
 
 
 @app.get("/queue/status")
@@ -206,6 +296,16 @@ async def predict_batch(files: list[UploadFile] = File(...)) -> dict[str, Any]:
     for task_id, result_payload in zip(task_ids, results):
         result_payload["task_id"] = task_id
     return {"count": len(results), "results": results}
+
+
+@app.websocket("/ws/stream")
+async def stream_emotion(websocket: WebSocket) -> None:
+    if streaming_service is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "detail": "Streaming service not ready."})
+        await websocket.close(code=1011)
+        return
+    await streaming_service.handle_stream(websocket)
 
 
 if __name__ == "__main__":
